@@ -1,0 +1,14 @@
+Sometimes the following error occurs:
+
+
+OpenCV Error: Unspecified error (GStreamer: your gstreamer installation is missing a required plugin
+) in handlemessage, file /home/andrey/bin/OpenCV/modules/videoio/src/cap_gstreamer.cpp, line 1692
+terminate called after throwing an instance of 'cv::Exception'
+  what():  /home/andrey/bin/OpenCV/modules/videoio/src/cap_gstreamer.cpp:1692: error: (-2) GStreamer: your gstreamer installation is missing a required plugin
+   in function handlemessage
+
+The solution is to install the required plugin. It is one of:
+- gstreamer-*
+- gstreamer1-*
+
+In the future we will figure which one exactly it is.
