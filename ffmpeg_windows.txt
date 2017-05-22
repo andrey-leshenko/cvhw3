@@ -1,0 +1,4 @@
+At first OpenCV can't read .MP4 files.
+The solution is to add the opencv_ffmpeg310.dll and opencv_ffmpeg310_64.dll to the system path.
+
+(For example add them to the System32 directory)
