@@ -2,6 +2,7 @@
 #include <vector>
 #include <string>
 #include <algorithm>
+#include <random>
 
 #include <opencv2/opencv.hpp>
 
@@ -42,6 +43,14 @@ void printTimeSinceLastCall(const char* message)
 	last = curr;
 }
 
+float r()
+{
+	static std::default_random_engine generator;
+	static std::uniform_real_distribution<float> distribution(0, 1);
+
+	return distribution(generator);
+}
+
 Mat videoMedian(const vector<Mat> &images)
 {
 	if (images.size() == 0)
@@ -76,11 +85,55 @@ Mat videoMedian(const vector<Mat> &images)
 	return median;
 }
 
-struct frame_state
+struct Pt
 {
-	vector<Point2f> markers;
-	vector<vector<int>> markerIds;
-	map<int, int> ids;
+	Point2f p;
+	Point2f v;
+
+	Pt(Point2f p)
+	{
+		this->p = p;
+		this->v = Point2f {(r() - 0.5f) * 20, (r() - 0.5f) * 20};
+	}
+
+	Pt(Point2f p, Point2f v)
+	{
+		this->p = p;
+		this->v = v;
+	}
+
+	Pt(const Pt &other)
+	{
+		this->p = other.p;
+		this->v = other.v;
+	}
+
+	Pt next()
+	{
+		return Pt(p + v, v + Point2f {(r() - 0.5f) * 10, (r() - 0.5f) * 10});
+	}
+};
+
+template <typename T>
+void increment(Mat& m, Pt p)
+{
+	int r = p.p.y;
+	int c = p.p.x;
+
+	if (r >= 0 && r < m.rows && c >= 0 && c < m.cols)
+		m.at<T>(r, c)++;
+};
+
+template <typename T>
+int sample(const Mat& m, Pt p)
+{
+	int r = p.p.y;
+	int c = p.p.x;
+
+	if (r >= 0 && r < m.rows && c >= 0 && c < m.cols)
+		return m.at<T>(r, c);
+	else
+		return -1;
 };
 
 int main(int argc, char *argv[])
@@ -137,52 +190,9 @@ int main(int argc, char *argv[])
 
 	auto getMarkerMask = [] (const Mat &foreground) -> Mat
 	{
-		Mat markerMask = foreground >= 30;
-
-		cv::erode(markerMask,
-			markerMask,
-			cv::getStructuringElement(cv::MORPH_ELLIPSE, Size {3, 3}),
-			cv::Point {-1, -1},
-			1);
-
-		//cv::morphologyEx(markerMask,
-		//markerMask,
-		//cv::MORPH_CLOSE,
-		//cv::getStructuringElement(cv::MORPH_ELLIPSE, Size{15, 15}));
-
-		//cv::morphologyEx(markerMask,
-		//markerMask,
-		//cv::MORPH_OPEN,
-		//cv::getStructuringElement(cv::MORPH_ELLIPSE, Size{7, 7}));
+		Mat markerMask = (foreground - 20) * 2;
 
 		return markerMask;
-	};
-
-	auto getFrameMarkers = [] (const Mat &markerMask) -> vector<Point2f>
-	{
-		vector<Point2f> markers;
-
-		Mat labels;
-		Mat stats;
-		Mat1d centroids;
-
-		cv::connectedComponentsWithStats(
-			markerMask,
-			labels,
-			stats,
-			centroids);
-
-		// NOTE: label 0 is the background. We ignore it here.
-
-		for (int r = 1; r < centroids.rows; r++)
-		{
-			if (stats.at<int>(r, cv::CC_STAT_AREA) > 20)
-			{
-				markers.push_back(Point2f {(float)centroids(r, 0), (float)centroids(r, 1)});
-			}
-		}
-
-		return markers;
 	};
 
 	vector<Mat> frames;
@@ -202,125 +212,90 @@ int main(int argc, char *argv[])
 		}
 	}
 
-	Mat background = videoMedian(vector<Mat>{frames.begin(), frames.begin() + std::max(frames.size(), (size_t)20)});
+	Mat background = videoMedian(vector<Mat>{frames.begin(), frames.begin() + std::max(frames.size(), (size_t)10)});
 
 	int frameCount = frames.size();
 	int frameIndex = 0;
+	int rows = frames[0].rows;
+	int cols = frames[0].cols;
 
-	vector<frame_state> states(frames.size());
-	int idCount = 0;
+	//const float splitProb = 0.5;
+	const float maxDensity = 4;
+
+	vector<vector<Pt>> particles(frames.size());
+	vector<Mat> heatMaps(frames.size());
 
 	for (int t = 0; t < frameCount; t++)
 	{
 		Mat foreground = getForeground(frames[t], background);
 		Mat markerMask = getMarkerMask(foreground);
 
-		vector<Point2f> currMarkers = getFrameMarkers(markerMask);
-		vector<vector<int>> currMarkerIds(currMarkers.size());
-		map<int, int> currIds;
-
-		if (t > 0)
+		if (t > 1)
 		{
-			vector<Point2f> lastMarkers = states[t - 1].markers;
-			vector<vector<int>> lastMarkerIds = states[t - 1].markerIds;
-			map<int, int> lastIds = states[t - 1].ids;
-
-			auto findClosest = [&currMarkers] (Point2f p, float distThreshold) -> vector<int>
+			for (Pt p : particles[t - 1])
 			{
-				float squareDistThreshold = distThreshold * distThreshold;
+				//do
+				//{
+				//	Pt next = p.next();
 
-				vector<pair<float, int>> pointsByDistance;
+				//	if (sample<unsigned char>(markerMask, next))
+				//	{
+				//		particles[t].push_back(next);
+				//	}
+				//} while (r() < splitProb);
 
-				for (int i = 0; i < currMarkers.size(); i++)
+				for (int i = 0; i < 16; i++)
 				{
-					float dx = p.x - currMarkers[i].x;
-					float dy = p.y - currMarkers[i].y;
+					Pt next = p.next();
 
-					float squareDist = dx * dx + dy * dy;
-
-					if (squareDist < squareDistThreshold)
-						pointsByDistance.push_back({squareDist, i});
-				}
-
-				std::sort(pointsByDistance.begin(), pointsByDistance.end());
-
-				vector<int> points;
-
-				for (auto p : pointsByDistance)
-					points.push_back(p.second);
-
-				return points;
-			};
-
-			for (int i = 0; i < lastMarkers.size(); i++)
-			{
-				if (lastMarkerIds[i].size() != 1)
-					continue;
-
-				vector<int> closest = findClosest(lastMarkers[i], 50);
-
-				if (closest.size() > 0)
-				{
-					int lastId = lastMarkerIds[i][0];
-					int newPoint = closest[0];
-					currMarkerIds[newPoint].push_back(lastId);
-					currIds[lastId] = newPoint;
-				}
-			}
-
-			for (int i = 0; i < lastMarkers.size(); i++)
-			{
-				if (lastMarkerIds[i].size() == 1)
-					continue;
-
-				vector<int> closest = findClosest(lastMarkers[i], 50);
-
-				vector<int> closestFull;
-				vector<int> closestEmpty;
-
-				for (auto p : closest)
-				{
-					if (currMarkerIds[p].size() > 0)
-						closestFull.push_back(p);
-					else
-						closestEmpty.push_back(p);
-				}
-
-				if (closest.size() == 0)
-					continue;
-
-				for (int k = 0; k < lastMarkerIds[i].size(); k++)
-				{
-					int lastId = lastMarkerIds[i][k];
-					int newPoint;
-
-					if (closestEmpty.size() != 0)
-						newPoint = closestEmpty[k % closestEmpty.size()];
-					else
-						newPoint = closestFull[0];
-
-					currMarkerIds[newPoint].push_back(lastId);
-					currIds[lastId] = newPoint;
+					if (sample<unsigned char>(markerMask, next))
+					{
+						particles[t].push_back(next);
+					}
 				}
 			}
 		}
 
-		for (int i = 0; i < currMarkerIds.size(); i++)
+		if (cv::countNonZero(markerMask) > 1 && t < 50)
 		{
-			if (currMarkerIds[i].size() == 0)
-			{
-				currMarkerIds[i].push_back(idCount);
-				currIds[idCount] = i;
+			int added = 0;
 
-				idCount++;
+			while (added < 100)
+			{
+				Pt pt {Point2f{r() * cols, r() * rows}};
+
+				if (sample<unsigned char>(markerMask, pt))
+				{
+					particles[t].push_back(pt);
+					added++;
+				}
 			}
 		}
 
-		CV_Assert(currMarkers.size() == currMarkerIds.size());
+		heatMaps[t] = Mat {frames[t].size(), CV_32S};
+		heatMaps[t].setTo(0);
 
-		states[t].markers = currMarkers;
-		states[t].markerIds = currMarkerIds;
-		states[t].ids = currIds;
+		for (Pt p : particles[t])
+		{
+			increment<int>(heatMaps[t], p);
+		}
+
+		particles[t].erase(
+			std::remove_if(
+				particles[t].begin(),
+				particles[t].end(),
+				[&heatMaps, t, maxDensity] (Pt p) {
+					float density = sample<int>(heatMaps[t], p);
+
+					if (density < 0)
+						return true;
+
+					float extra = std::max(density - maxDensity, 0.0f) / std::max(density, 1.0f);
+					return r() < extra;
+			}),
+			particles[t].end());
+
+		std::cout << particles[t].size() << std::endl;
 
 		std::cout << "Processed frame " << t << std::endl;
 	}
@@ -348,6 +323,7 @@ int main(int argc, char *argv[])
 #endif
 
 	bool playing = false;
+	bool showingParticles = true;
 	int mode = 1;
 
 	while (true)
@@ -355,10 +331,6 @@ int main(int argc, char *argv[])
 		Mat frame = frames[frameIndex];
 		Mat foreground = getForeground(frame, background);
 		Mat markerMask = getMarkerMask(foreground);
-
-		auto &currMarkers = states[frameIndex].markers;
-		auto &currMarkerIds = states[frameIndex].markerIds;
-		auto &currIds = states[frameIndex].ids;
 
 		Mat display;
 
@@ -372,81 +344,22 @@ int main(int argc, char *argv[])
 			break;
 		case 3:
 			cv::cvtColor(markerMask, display, cv::COLOR_GRAY2BGR);
-			for (int i = 0; i < currMarkers.size(); i++)
-			{
-				Point2f pos = currMarkers[i];
-				int id = states[frameIndex].markerIds[i][0];
-				Scalar c = currMarkerIds[i].size() > 1 ? Scalar {0, 255, 255} : Scalar {0, 0, 255};
-				cv::circle(display, pos, 4, c, -1);
-				cv::rectangle(display, pos + Point2f {5, -7}, pos + Point2f {15, 7}, Scalar {255, 255, 255}, -1);
-				cv::putText(display, std::to_string(id),
-					pos + Point2f{5, 5}, cv::FONT_HERSHEY_PLAIN, 1, Scalar{0});
-			}
 			break;
 		case 4:
-			cv::cvtColor(frame, display, cv::COLOR_GRAY2BGR);
-			for (int i = 0; i < currMarkers.size(); i++)
-			{
-				Point2f pos = currMarkers[i];
-				int id = states[frameIndex].markerIds[i][0];
-				Scalar c = currMarkerIds[i].size() > 1 ? Scalar {0, 255, 255} : Scalar {0, 0, 255};
-				cv::circle(display, pos, 4, c, -1);
-				cv::rectangle(display, pos + Point2f {5, -7}, pos + Point2f {15, 7}, Scalar {255, 255, 255}, -1);
-				cv::putText(display, std::to_string(id),
-					pos + Point2f {5, 5}, cv::FONT_HERSHEY_PLAIN, 1, Scalar {0});
-			}
-			break;
-		case 5:
-			if (frameIndex > 0)
-				cv::absdiff(frames[frameIndex], frames[frameIndex - 1], display);
-			else
-				display = frame.clone();
+			heatMaps[frameIndex].convertTo(display, CV_8U, 256 / maxDensity);
 			break;
 		default:
 			display = frame.clone();
 		}
 
+		if (showingParticles)
 		{
 			if (display.type() == CV_8U)
 				cv::cvtColor(display, display, cv::COLOR_GRAY2BGR);
 
-			const vector<Scalar> colorPalette = {
-				{180, 119, 31},
-				{14, 127, 255},
-				{44, 160, 44},
-				{40, 39, 214},
-				{189, 103, 148},
-				{75, 86, 140},
-				{194, 119, 227},
-				{127, 127, 127},
-				{34, 189, 188},
-				{207, 190, 23},
-			};
-
-			vector<int> activeIds;
-
-			for (pair<int, int> p : currIds)
-				activeIds.push_back(p.first);
-
-			cv::setWindowTitle("w", "Active bugs: " + std::to_string(activeIds.size()));
-
-			for (int k = frameIndex - 1; k >= 0 && frameIndex - k < 30; k--)
+			for (Pt p : particles[frameIndex])
 			{
-				if (activeIds.size() == 0)
-					break;
-
-				vector<int> newIds;
-
-				for (int id : activeIds)
-				{
-					if (states[k].ids.find(id) != states[k].ids.end())
-					{
-						cv::line(display, states[k + 1].markers[states[k + 1].ids[id]], states[k].markers[states[k].ids[id]], colorPalette[id % colorPalette.size()]);
-						newIds.push_back(id);
-					}
-				}
-
-				activeIds = newIds;
+				cv::circle(display, p.p, 1, Scalar {0, 0, 255}, -1);
 			}
 		}
 
@@ -481,6 +394,9 @@ int main(int argc, char *argv[])
 			break;
 		case KEY_ARROW_UP:
 			mode = std::max(mode - 1, 0);
+			break;
+		case 'p':
+			showingParticles = !showingParticles;
 			break;
 		default:
 			break;
