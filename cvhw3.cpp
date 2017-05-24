@@ -128,7 +128,6 @@ int main(int argc, char *argv[])
 		}
 	}
 
-
 	auto getForeground = [] (const Mat &frame, const Mat &background) -> Mat
 	{
 		Mat foreground;
@@ -203,7 +202,7 @@ int main(int argc, char *argv[])
 		}
 	}
 
-	Mat background = videoMedian(vector<Mat>{frames.begin(), frames.begin() + std::max(frames.size(), (size_t)100)});
+	Mat background = videoMedian(vector<Mat>{frames.begin(), frames.begin() + std::max(frames.size(), (size_t)20)});
 
 	int frameCount = frames.size();
 	int frameIndex = 0;
@@ -211,47 +210,97 @@ int main(int argc, char *argv[])
 	vector<frame_state> states(frames.size());
 	int idCount = 0;
 
-	for (int i = 0; i < frameCount; i++)
+	for (int t = 0; t < frameCount; t++)
 	{
-		Mat foreground = getForeground(frames[i], background);
+		Mat foreground = getForeground(frames[t], background);
 		Mat markerMask = getMarkerMask(foreground);
 
 		vector<Point2f> currMarkers = getFrameMarkers(markerMask);
 		vector<vector<int>> currMarkerIds(currMarkers.size());
 		map<int, int> currIds;
 
-		if (i > 0)
+		if (t > 0)
 		{
-			vector<Point2f> lastMarkers = states[i - 1].markers;
-			vector<vector<int>> lastMarkerIds = states[i - 1].markerIds;
-			map<int, int> lastIds = states[i - 1].ids;
+			vector<Point2f> lastMarkers = states[t - 1].markers;
+			vector<vector<int>> lastMarkerIds = states[t - 1].markerIds;
+			map<int, int> lastIds = states[t - 1].ids;
 
-			for (int j = 0; j < lastMarkers.size(); j++)
+			auto findClosest = [&currMarkers] (Point2f p, float distThreshold) -> vector<int>
 			{
-				float minSquareDistance = FLT_MAX;
-				int minIndex = -1;
+				float squareDistThreshold = distThreshold * distThreshold;
 
-				for (int k = 0; k < currMarkers.size(); k++)
+				vector<pair<float, int>> pointsByDistance;
+
+				for (int i = 0; i < currMarkers.size(); i++)
 				{
-					if (currMarkerIds[k].size() != 0)
-						continue;
+					float dx = p.x - currMarkers[i].x;
+					float dy = p.y - currMarkers[i].y;
 
-					float dx = lastMarkers[j].x - currMarkers[k].x;
-					float dy = lastMarkers[j].y - currMarkers[k].y;
+					float squareDist = dx * dx + dy * dy;
 
-					float squareDistance = dx * dx + dy * dy;
-
-					if (squareDistance < minSquareDistance)
-					{
-						minSquareDistance = squareDistance;
-						minIndex = k;
-					}
+					if (squareDist < squareDistThreshold)
+						pointsByDistance.push_back({squareDist, i});
 				}
 
-				if (minIndex >= 0 && minSquareDistance <= (25 * 25))
+				std::sort(pointsByDistance.begin(), pointsByDistance.end());
+
+				vector<int> points;
+
+				for (auto p : pointsByDistance)
+					points.push_back(p.second);
+
+				return points;
+			};
+
+			for (int i = 0; i < lastMarkers.size(); i++)
+			{
+				if (lastMarkerIds[i].size() != 1)
+					continue;
+
+				vector<int> closest = findClosest(lastMarkers[i], 50);
+
+				if (closest.size() > 0)
 				{
-					currMarkerIds[minIndex].push_back(lastMarkerIds[j][0]);
-					currIds[lastMarkerIds[j][0]] = minIndex;
+					int lastId = lastMarkerIds[i][0];
+					int newPoint = closest[0];
+					currMarkerIds[newPoint].push_back(lastId);
+					currIds[lastId] = newPoint;
+				}
+			}
+
+			for (int i = 0; i < lastMarkers.size(); i++)
+			{
+				if (lastMarkerIds[i].size() == 1)
+					continue;
+
+				vector<int> closest = findClosest(lastMarkers[i], 50);
+
+				vector<int> closestFull;
+				vector<int> closestEmpty;
+
+				for (auto p : closest)
+				{
+					if (currMarkerIds[p].size() > 0)
+						closestFull.push_back(p);
+					else
+						closestEmpty.push_back(p);
+				}
+
+				if (closest.size() == 0)
+					continue;
+
+				for (int k = 0; k < lastMarkerIds[i].size(); k++)
+				{
+					int lastId = lastMarkerIds[i][k];
+					int newPoint;
+
+					if (closestEmpty.size() != 0)
+						newPoint = closestEmpty[k % closestEmpty.size()];
+					else
+						newPoint = closestFull[0];
+
+					currMarkerIds[newPoint].push_back(lastId);
+					currIds[lastId] = newPoint;
 				}
 			}
 		}
@@ -269,11 +318,11 @@ int main(int argc, char *argv[])
 
 		CV_Assert(currMarkers.size() == currMarkerIds.size());
 
-		states[i].markers = currMarkers;
-		states[i].markerIds = currMarkerIds;
-		states[i].ids = currIds;
+		states[t].markers = currMarkers;
+		states[t].markerIds = currMarkerIds;
+		states[t].ids = currIds;
 
-		std::cout << "Processed frame " << i << std::endl;
+		std::cout << "Processed frame " << t << std::endl;
 	}
 
 #ifdef _WIN32
@@ -327,7 +376,8 @@ int main(int argc, char *argv[])
 			{
 				Point2f pos = currMarkers[i];
 				int id = states[frameIndex].markerIds[i][0];
-				cv::circle(display, pos, 4, Scalar {0, 0, 255}, -1);
+				Scalar c = currMarkerIds[i].size() > 1 ? Scalar {0, 255, 255} : Scalar {0, 0, 255};
+				cv::circle(display, pos, 4, c, -1);
 				cv::rectangle(display, pos + Point2f {5, -7}, pos + Point2f {15, 7}, Scalar {255, 255, 255}, -1);
 				cv::putText(display, std::to_string(id),
 					pos + Point2f{5, 5}, cv::FONT_HERSHEY_PLAIN, 1, Scalar{0});
@@ -339,7 +389,8 @@ int main(int argc, char *argv[])
 			{
 				Point2f pos = currMarkers[i];
 				int id = states[frameIndex].markerIds[i][0];
-				cv::circle(display, pos, 4, Scalar {0, 0, 255}, -1);
+				Scalar c = currMarkerIds[i].size() > 1 ? Scalar {0, 255, 255} : Scalar {0, 0, 255};
+				cv::circle(display, pos, 4, c, -1);
 				cv::rectangle(display, pos + Point2f {5, -7}, pos + Point2f {15, 7}, Scalar {255, 255, 255}, -1);
 				cv::putText(display, std::to_string(id),
 					pos + Point2f {5, 5}, cv::FONT_HERSHEY_PLAIN, 1, Scalar {0});
@@ -348,6 +399,8 @@ int main(int argc, char *argv[])
 		case 5:
 			if (frameIndex > 0)
 				cv::absdiff(frames[frameIndex], frames[frameIndex - 1], display);
+			else
+				display = frame.clone();
 			break;
 		default:
 			display = frame.clone();
@@ -375,7 +428,9 @@ int main(int argc, char *argv[])
 			for (pair<int, int> p : currIds)
 				activeIds.push_back(p.first);
 
-			for (int k = frameIndex - 1; k >= 0; k--)
+			cv::setWindowTitle("w", "Active bugs: " + std::to_string(activeIds.size()));
+
+			for (int k = frameIndex - 1; k >= 0 && frameIndex - k < 30; k--)
 			{
 				if (activeIds.size() == 0)
 					break;
