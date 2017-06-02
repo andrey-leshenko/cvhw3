@@ -79,13 +79,49 @@ Mat videoMedian(const vector<Mat> &images)
 	return median;
 }
 
-struct frame_state
+struct Edge
+{
+	int from;
+	int to;
+	Point2f dir;
+	float weight;
+
+	Edge(int from, int to, Point2f dir, float weight = 1)
+		: from{from}, to{to}, dir{dir}, weight{weight}
+	{ }
+};
+
+struct Tracker
+{
+	int id;
+	float prob;
+	Point2f dir;
+
+	Tracker(int id, float prob = 1, Point2f dir = Point2f{0, 0})
+		: id{id}, prob{prob}, dir{dir}
+	{ }
+};
+
+struct FrameState
 {
 	vector<Point2f> markers;
-	//vector<vector<int>> markerIds;
-	//map<int, int> ids;
-	multimap<int, int> transition;
+
+	// How the markers from the last frame moved
+	multimap<int, Edge> mov;
+
+	//multimap<int, Tracker> trackers;
+	vector<vector<Tracker>> trackers;
+	map<int, int> ids;
 };
+
+void drawStateTransitions(Mat &on, const FrameState& first, const FrameState& second)
+{
+	for (pair<int, Edge> transition : second.mov)
+	{
+		Edge e = transition.second;
+		cv::arrowedLine(on, first.markers[e.from], second.markers[e.to], Scalar{0, 255, 0});
+	}
+}
 
 int main(int argc, char *argv[])
 {
@@ -96,7 +132,7 @@ int main(int argc, char *argv[])
 	//
 
 	{
-		string fileName;
+		string fileName = "bugs11";
 
 		if (argc == 2)
 			fileName = string{argv[1]};
@@ -211,7 +247,7 @@ int main(int argc, char *argv[])
 	int frameCount = frames.size();
 	int frameIndex = 0;
 
-	vector<frame_state> states(frames.size());
+	vector<FrameState> states(frames.size());
 	int idCount = 0;
 
 	for (int t = 0; t < frameCount; t++)
@@ -220,21 +256,12 @@ int main(int argc, char *argv[])
 		Mat markerMask = getMarkerMask(foreground);
 
 		vector<Point2f> currMarkers = getFrameMarkers(markerMask);
-		vector<vector<int>> currMarkerIds(currMarkers.size());
-		map<int, int> currIds;
+		vector<Point2f> lastMarkers = t > 0 ? states[t - 1].markers : vector<Point2f>{};
 
-		vector<Point2f> lastMarkers;
+		//
+		// Create the transition graph
+		//
 
-		if (t > 0)
-		{
-			lastMarkers = states[t - 1].markers;
-		}
-
-		float lowThresh = 50 * 50;
-
-		Mat1f dist{(int)lastMarkers.size(), (int)currMarkers.size()};
-		vector<bool> lastQ(lastMarkers.size(), false);
-		vector<bool> currQ(currMarkers.size(), false);
 		vector<std::tuple<float, int, int>> distList;
 
 		for (int i = 0; i < lastMarkers.size(); i++)
@@ -246,7 +273,8 @@ int main(int argc, char *argv[])
 
 				float squareDist = dx * dx + dy * dy;
 
-				dist(i, k) = squareDist;
+				const float lowThresh = 50 * 50;
+
 				if (squareDist <= lowThresh)
 				{
 					distList.push_back({squareDist, i, k});
@@ -256,146 +284,46 @@ int main(int argc, char *argv[])
 
 		std::sort(distList.begin(), distList.end());
 
-		for (tuple<float, int, int> d : distList)
+		vector<bool> lastConnected(lastMarkers.size(), false);
+		vector<bool> currConnected(currMarkers.size(), false);
+
+		for (int iter = 0; iter < 2; iter++)
 		{
-			float distance;
-			int i, k;
-
-			std::tie(distance, i, k) = d;
-
-			if (!lastQ[i])
+			for (tuple<float, int, int> d : distList)
 			{
-				states[t].transition.insert({i, k});
-				lastQ[i] = true;
-				currQ[k] = true;
+				float distance;
+				int i, k;
+
+				std::tie(distance, i, k) = d;
+
+				if ((iter == 0 && !lastConnected[i]) ||
+					(iter == 1 && !currConnected[k]))
+				{
+					Edge e{i, k, currMarkers[k] - lastMarkers[i]};
+					states[t].mov.insert({i, e});
+					lastConnected[i] = true;
+					currConnected[k] = true;
+				}
 			}
 		}
 
-		for (tuple<float, int, int> d : distList)
+		//
+		// Assign ids to empty markers
+		//
+
+		states[t].trackers = vector<vector<Tracker>>(currMarkers.size());
+
+		for (int i = 0; i < (int)currMarkers.size(); i++)
 		{
-			float distance;
-			int i, k;
-
-			std::tie(distance, i, k) = d;
-
-			if (!currQ[k])
+			if (states[t].trackers[i].empty())
 			{
-				states[t].transition.insert({i, k});
-				lastQ[i] = true;
-				currQ[k] = true;
+				int newId = idCount++;
+				states[t].trackers[i].push_back(Tracker{newId});
+				states[t].ids[newId] = i;
 			}
 		}
-
-		//for (int i = 0; i < lastMarkers.size(); i++)
-		//{
-		//	for (int k = 0; k < currMarkers.size(); k++)
-		//	{
-		//		if (dist(i, k) <= lowThresh)
-		//		{
-		//			states[t].transition.insert({i, k});
-		//		}
-		//	}
-		//}
-
-		auto findClosest = [&currMarkers](Point2f p, float distThreshold) -> vector<int>
-		{
-			float squareDistThreshold = distThreshold * distThreshold;
-
-			vector<pair<float, int>> pointsByDistance;
-
-			for (int i = 0; i < currMarkers.size(); i++)
-			{
-				float dx = p.x - currMarkers[i].x;
-				float dy = p.y - currMarkers[i].y;
-
-				float squareDist = dx * dx + dy * dy;
-
-				if (squareDist < squareDistThreshold)
-					pointsByDistance.push_back({squareDist, i});
-			}
-
-			std::sort(pointsByDistance.begin(), pointsByDistance.end());
-
-			vector<int> points;
-
-			for (auto p : pointsByDistance)
-				points.push_back(p.second);
-
-			return points;
-		};
-
-		if (t > 0)
-		{
-			//vector<vector<int>> lastMarkerIds = states[t - 1].markerIds;
-			//map<int, int> lastIds = states[t - 1].ids;
-
-			//for (int i = 0; i < lastMarkers.size(); i++)
-			//{
-			//	if (lastMarkerIds[i].size() != 1)
-			//		continue;
-
-			//	vector<int> closest = findClosest(lastMarkers[i], 50);
-
-			//	if (closest.size() > 0)
-			//	{
-			//		int lastId = lastMarkerIds[i][0];
-			//		int newPoint = closest[0];
-			//		currMarkerIds[newPoint].push_back(lastId);
-			//		currIds[lastId] = newPoint;
-			//	}
-			//}
-
-			//for (int i = 0; i < lastMarkers.size(); i++)
-			//{
-			//	if (lastMarkerIds[i].size() == 1)
-			//		continue;
-
-			//	vector<int> closest = findClosest(lastMarkers[i], 50);
-
-			//	vector<int> closestFull;
-			//	vector<int> closestEmpty;
-
-			//	for (auto p : closest)
-			//	{
-			//		if (currMarkerIds[p].size() > 0)
-			//			closestFull.push_back(p);
-			//		else
-			//			closestEmpty.push_back(p);
-			//	}
-
-			//	if (closest.size() == 0)
-			//		continue;
-
-			//	for (int k = 0; k < lastMarkerIds[i].size(); k++)
-			//	{
-			//		int lastId = lastMarkerIds[i][k];
-			//		int newPoint;
-
-			//		if (closestEmpty.size() != 0)
-			//			newPoint = closestEmpty[k % closestEmpty.size()];
-			//		else
-			//			newPoint = closestFull[0];
-
-			//		currMarkerIds[newPoint].push_back(lastId);
-			//		currIds[lastId] = newPoint;
-			//	}
-			//}
-		}
-
-		//for (int i = 0; i < currMarkerIds.size(); i++)
-		//{
-		//	if (currMarkerIds[i].size() == 0)
-		//	{
-		//		currMarkerIds[i].push_back(idCount);
-		//		currIds[idCount] = i;
-
-		//		idCount++;
-		//	}
-		//}
 
 		states[t].markers = currMarkers;
-		//states[t].markerIds = currMarkerIds;
-		//states[t].ids = currIds;
 
 		std::cout << "Processed frame " << t << std::endl;
 	}
@@ -422,8 +350,11 @@ int main(int argc, char *argv[])
 	};
 #endif
 
-	bool playing = false;
+	bool playing = true;
 	int mode = 5;
+
+	bool qShowTransitions = true;
+	bool qShowIds = true;
 
 	while (true)
 	{
@@ -560,9 +491,19 @@ int main(int argc, char *argv[])
 		//	}
 		//}
 
-		for (pair<int, int> transition : states[frameIndex].transition)
+		if (qShowTransitions && frameIndex > 0)
 		{
-			cv::arrowedLine(display, lastMarkers[transition.first], currMarkers[transition.second], Scalar{0, 255, 0});
+			drawStateTransitions(display, states[frameIndex - 1], states[frameIndex]);
+		}
+		if (qShowIds)
+		{
+			for (auto p : states[frameIndex].ids)
+			{
+				int id = p.first;
+				Point2f position = states[frameIndex].markers[p.second];
+				cv::putText(display, std::to_string(id), position, cv::FONT_HERSHEY_SIMPLEX, 0.5, Scalar{0, 0, 0}, 3);
+				cv::putText(display, std::to_string(id), position, cv::FONT_HERSHEY_SIMPLEX, 0.5, Scalar{255, 255, 255});
+			}
 		}
 
 		cv::imshow("w", display);
@@ -596,6 +537,12 @@ int main(int argc, char *argv[])
 			break;
 		case KEY_ARROW_UP:
 			mode = std::max(mode - 1, 1);
+			break;
+		case 't':
+			qShowTransitions = !qShowTransitions;
+			break;
+		case 'n':
+			qShowIds = !qShowIds;
 			break;
 		default:
 			break;
