@@ -97,9 +97,14 @@ struct Tracker
 	float prob;
 	Point2f dir;
 
-	Tracker(int id, float prob = 1, Point2f dir = Point2f{0, 0})
+	Tracker(int id = 0, float prob = 1, Point2f dir = Point2f{0, 0})
 		: id{id}, prob{prob}, dir{dir}
 	{ }
+
+	bool operator<(const Tracker& other) const
+	{
+		return id < other.id;
+	}
 };
 
 struct FrameState
@@ -132,7 +137,7 @@ int main(int argc, char *argv[])
 	//
 
 	{
-		string fileName = "bugs11";
+		string fileName;
 
 		if (argc == 2)
 			fileName = string{argv[1]};
@@ -252,11 +257,20 @@ int main(int argc, char *argv[])
 
 	for (int t = 0; t < frameCount; t++)
 	{
+		//
+		// Extract foreground and markers
+		//
+
 		Mat foreground = getForeground(frames[t], background);
 		Mat markerMask = getMarkerMask(foreground);
 
 		vector<Point2f> currMarkers = getFrameMarkers(markerMask);
 		vector<Point2f> lastMarkers = t > 0 ? states[t - 1].markers : vector<Point2f>{};
+
+		vector<vector<Tracker>> emptyTrackers;
+
+		auto &currTrackers = states[t].trackers;
+		auto &lastTrackers = t > 0 ? states[t - 1].trackers : emptyTrackers;
 
 		//
 		// Create the transition graph
@@ -308,17 +322,108 @@ int main(int argc, char *argv[])
 		}
 
 		//
+		// Simulate movement from previous frame
+		//
+
+		currTrackers = vector<vector<Tracker>>(currMarkers.size());
+
+		for (int i = 0; i < (int)lastTrackers.size(); i++)
+		{
+			auto edgeRange = states[t].mov.equal_range(i);
+
+			vector<Edge> edges;
+
+			for (auto e = edgeRange.first; e != edgeRange.second; e++)
+			{
+				edges.push_back(e->second);
+			}
+
+			for (Tracker t : lastTrackers[i])
+			{
+				for (Edge e : edges)
+				{
+					float newProb = t.prob / edges.size();
+
+					auto it = std::find_if(currTrackers[e.to].begin(), currTrackers[e.to].end(), [t](Tracker other) { return other.id == t.id; });
+
+					if (it != currTrackers[e.to].end())
+					{
+						it->prob += newProb;
+					}
+					else
+					{
+						currTrackers[e.to].push_back(Tracker{t.id, newProb});
+					}
+				}
+			}
+		}
+
+		vector<bool> markerUsed(currMarkers.size(), false);
+		vector<int> usedIds;
+
+		vector<tuple<float, int, Tracker>> allTrackers;
+
+		for (int i = 0; i < (int)currTrackers.size(); i++)
+		{
+			for (Tracker t : currTrackers[i])
+			{
+				allTrackers.push_back({t.prob, i, t});
+			}
+		}
+
+		// Reverse sort
+		std::sort(allTrackers.rbegin(), allTrackers.rend());
+
+		vector<pair<int, Tracker>> newTrackers;
+
+		for (auto item : allTrackers)
+		{
+			float prob;
+			int marker;
+			Tracker tracker;
+
+			std::tie(prob, marker, tracker) = item;
+
+			if (!markerUsed[marker] && std::find(usedIds.begin(), usedIds.end(), tracker.id) == usedIds.end())
+			{
+				tracker.prob = 1;
+				newTrackers.push_back({marker, tracker});
+				markerUsed[marker] = true;
+				usedIds.push_back(tracker.id);
+				states[t].ids[tracker.id] = marker;
+			}
+		}
+
+		for (auto t : allTrackers)
+		{
+			float prob;
+			int marker;
+			Tracker tracker;
+
+			std::tie(prob, marker, tracker) = t;
+
+			if (std::find(usedIds.begin(), usedIds.end(), tracker.id) == usedIds.end())
+				newTrackers.push_back({marker, tracker});
+		}
+
+		for (auto &v : currTrackers)
+			v.resize(0);
+
+		for (pair<int, Tracker> t : newTrackers)
+		{
+			currTrackers[t.first].push_back(t.second);
+		}
+
+		//
 		// Assign ids to empty markers
 		//
 
-		states[t].trackers = vector<vector<Tracker>>(currMarkers.size());
-
-		for (int i = 0; i < (int)currMarkers.size(); i++)
+		for (int i = 0; i < (int)currTrackers.size(); i++)
 		{
-			if (states[t].trackers[i].empty())
+			if (currTrackers[i].empty())
 			{
 				int newId = idCount++;
-				states[t].trackers[i].push_back(Tracker{newId});
+				currTrackers[i].push_back(Tracker{newId});
 				states[t].ids[newId] = i;
 			}
 		}
@@ -507,6 +612,7 @@ int main(int argc, char *argv[])
 		}
 
 		cv::imshow("w", display);
+		cv::setWindowTitle("w", "Active trackers: " + std::to_string(states[frameIndex].ids.size()));
 
 		if (playing)
 			frameIndex = std::min(frameIndex + 1, frameCount - 1);
