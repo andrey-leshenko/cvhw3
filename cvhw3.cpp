@@ -113,6 +113,7 @@ struct FrameState
 
 	// How the markers from the last frame moved
 	multimap<int, Edge> mov;
+	multimap<int, Edge> imov;
 
 	//multimap<int, Tracker> trackers;
 	vector<vector<Tracker>> trackers;
@@ -313,8 +314,12 @@ int main(int argc, char *argv[])
 				if ((iter == 0 && !lastConnected[i]) ||
 					(iter == 1 && !currConnected[k]))
 				{
-					Edge e{i, k, currMarkers[k] - lastMarkers[i]};
-					states[t].mov.insert({i, e});
+					Edge edge{i, k, currMarkers[k] - lastMarkers[i]};
+					states[t].mov.insert({i, edge});
+
+					Edge inverseEdge{k, i, lastMarkers[i] - currMarkers[k]};
+					states[t].imov.insert({k, inverseEdge});
+
 					lastConnected[i] = true;
 					currConnected[k] = true;
 				}
@@ -395,6 +400,47 @@ int main(int argc, char *argv[])
 				markerUsed[marker] = true;
 				usedIds.push_back(tracker.id);
 				states[t].ids[tracker.id] = marker;
+
+				// Backpatch - put the id in all previous frames where
+				// it was just a probability.
+
+				int lastMarker = marker;
+
+				for (int i = t - 1; i >= 0; i--)
+				{
+					if (states[i].ids.find(tracker.id) != states[i].ids.end())
+						break;
+
+					auto positionRange = states[i + 1].imov.equal_range(lastMarker);
+
+					int maxMarker = -1;
+					float maxProb = 0;
+
+					// Find all edges that went to the last marker,
+					// and find where was the tracker with the biggest probability.
+
+					for (auto p = positionRange.first; p != positionRange.second; p++)
+					{
+						Edge edge = p->second;
+						int targetMarker = edge.to;
+
+						for (Tracker t : states[i].trackers[targetMarker])
+						{
+							if (t.id == tracker.id &&
+								t.prob > maxProb)
+							{
+								maxMarker = targetMarker;
+								maxProb = t.prob;
+							}
+						}
+					}
+
+					if (maxMarker < 0)
+						break;
+
+					states[i].ids[tracker.id] = maxMarker;
+					lastMarker = maxMarker;
+				}
 			}
 		}
 
@@ -466,6 +512,7 @@ int main(int argc, char *argv[])
 	bool qShowTransitions = true;
 	bool qShowIds = true;
 	bool qShowTrails = true;
+	bool qShowMarkerIds = false;
 
 	float scalingFactor = 2;
 
@@ -557,27 +604,6 @@ int main(int argc, char *argv[])
 
 		cv::resize(display, display, Size{(int)(display.cols * scalingFactor), (int)(display.rows * scalingFactor)});
 
-		if (qShowMarkers)
-		{
-			for (int i = 0; i < currMarkers.size(); i++)
-			{
-				cv::circle(display, currMarkers[i] * scalingFactor, 4, Scalar{0, 0, 255}, -1);
-			}
-		}
-		if (qShowTransitions && frameIndex > 0)
-		{
-			drawStateTransitions(display, states[frameIndex - 1], states[frameIndex], scalingFactor);
-		}
-		if (qShowIds)
-		{
-			for (auto p : states[frameIndex].ids)
-			{
-				int id = p.first;
-				Point2f position = states[frameIndex].markers[p.second];
-				cv::putText(display, std::to_string(id), position * scalingFactor, cv::FONT_HERSHEY_SIMPLEX, 0.5, Scalar{0, 0, 0}, 3);
-				cv::putText(display, std::to_string(id), position * scalingFactor, cv::FONT_HERSHEY_SIMPLEX, 0.5, Scalar{255, 255, 255});
-			}
-		}
 		if (qShowTrails)
 		{
 			const vector<Scalar> colorPalette = {
@@ -618,6 +644,36 @@ int main(int argc, char *argv[])
 				}
 
 				activeIds = newIds;
+			}
+		}
+		if (qShowMarkers)
+		{
+			for (int i = 0; i < currMarkers.size(); i++)
+			{
+				cv::circle(display, currMarkers[i] * scalingFactor, 4, Scalar{0, 0, 255}, -1);
+			}
+		}
+		if (qShowTransitions && frameIndex > 0)
+		{
+			drawStateTransitions(display, states[frameIndex - 1], states[frameIndex], scalingFactor);
+		}
+		if (qShowIds)
+		{
+			for (auto p : states[frameIndex].ids)
+			{
+				int id = p.first;
+				Point2f position = states[frameIndex].markers[p.second];
+				cv::putText(display, std::to_string(id), position * scalingFactor, cv::FONT_HERSHEY_SIMPLEX, 0.5, Scalar{0, 0, 0}, 3);
+				cv::putText(display, std::to_string(id), position * scalingFactor, cv::FONT_HERSHEY_SIMPLEX, 0.5, Scalar{255, 255, 255});
+			}
+		}
+		if (qShowMarkerIds)
+		{
+			for (int i = 0; i < (int)states[frameIndex].markers.size(); i++)
+			{
+				Point2f marker = states[frameIndex].markers[i];
+				cv::putText(display, std::to_string(i), marker * scalingFactor, cv::FONT_HERSHEY_SIMPLEX, 0.5, Scalar{0, 0, 0}, 3);
+				cv::putText(display, std::to_string(i), marker * scalingFactor, cv::FONT_HERSHEY_SIMPLEX, 0.5, Scalar{0, 255, 255});
 			}
 		}
 
@@ -665,6 +721,8 @@ int main(int argc, char *argv[])
 			break;
 		case 'r':
 			qShowTrails = !qShowTrails;
+		case 'd':
+			qShowMarkerIds = !qShowMarkerIds;
 			break;
 		default:
 			break;
