@@ -119,12 +119,12 @@ struct FrameState
 	map<int, int> ids;
 };
 
-void drawStateTransitions(Mat &on, const FrameState& first, const FrameState& second)
+void drawStateTransitions(Mat &on, const FrameState& first, const FrameState& second, float scalingFactor = 1)
 {
 	for (pair<int, Edge> transition : second.mov)
 	{
 		Edge e = transition.second;
-		cv::arrowedLine(on, first.markers[e.from], second.markers[e.to], Scalar{0, 255, 0});
+		cv::arrowedLine(on, first.markers[e.from] * scalingFactor, second.markers[e.to] * scalingFactor, Scalar{0, 255, 0});
 	}
 }
 
@@ -344,15 +344,20 @@ int main(int argc, char *argv[])
 				{
 					float newProb = t.prob / edges.size();
 
+					newProb *= 0.97f;
+
 					auto it = std::find_if(currTrackers[e.to].begin(), currTrackers[e.to].end(), [t](Tracker other) { return other.id == t.id; });
 
-					if (it != currTrackers[e.to].end())
+					if (newProb >= 0.05)
 					{
-						it->prob += newProb;
-					}
-					else
-					{
-						currTrackers[e.to].push_back(Tracker{t.id, newProb});
+						if (it != currTrackers[e.to].end())
+						{
+							it->prob += newProb;
+						}
+						else
+						{
+							currTrackers[e.to].push_back(Tracker{t.id, newProb});
+						}
 					}
 				}
 			}
@@ -371,7 +376,6 @@ int main(int argc, char *argv[])
 			}
 		}
 
-		// Reverse sort
 		std::sort(allTrackers.rbegin(), allTrackers.rend());
 
 		vector<pair<int, Tracker>> newTrackers;
@@ -458,8 +462,12 @@ int main(int argc, char *argv[])
 	bool playing = true;
 	int mode = 5;
 
+	bool qShowMarkers = true;
 	bool qShowTransitions = true;
 	bool qShowIds = true;
+	bool qShowTrails = true;
+
+	float scalingFactor = 2;
 
 	while (true)
 	{
@@ -487,17 +495,9 @@ int main(int argc, char *argv[])
 			break;
 		case 3:
 			cv::cvtColor(markerMask, display, cv::COLOR_GRAY2BGR);
-			for (int i = 0; i < currMarkers.size(); i++)
-			{
-				cv::circle(display, currMarkers[i], 4, Scalar{0, 0, 255}, -1);
-			}
 			break;
 		case 4:
 			cv::cvtColor(frame, display, cv::COLOR_GRAY2BGR);
-			for (int i = 0; i < currMarkers.size(); i++)
-			{
-				cv::circle(display, currMarkers[i], 4, Scalar{0, 0, 255}, -1);
-			}
 			break;
 		case 5:
 		case 6:
@@ -552,53 +552,21 @@ int main(int argc, char *argv[])
 			display = frame.clone();
 		}
 
-		//{
-		//	if (display.type() == CV_8U)
-		//		cv::cvtColor(display, display, cv::COLOR_GRAY2BGR);
+		if (display.type() == CV_8U)
+			cv::cvtColor(display, display, cv::COLOR_GRAY2BGR);
 
-		//	const vector<Scalar> colorPalette = {
-		//		{180, 119, 31},
-		//		{14, 127, 255},
-		//		{44, 160, 44},
-		//		{40, 39, 214},
-		//		{189, 103, 148},
-		//		{75, 86, 140},
-		//		{194, 119, 227},
-		//		{127, 127, 127},
-		//		{34, 189, 188},
-		//		{207, 190, 23},
-		//	};
+		cv::resize(display, display, Size{(int)(display.cols * scalingFactor), (int)(display.rows * scalingFactor)});
 
-		//	vector<int> activeIds;
-
-		//	for (pair<int, int> p : currIds)
-		//		activeIds.push_back(p.first);
-
-		//	cv::setWindowTitle("w", "Active bugs: " + std::to_string(activeIds.size()));
-
-		//	for (int k = frameIndex - 1; k >= 0 && frameIndex - k < 30; k--)
-		//	{
-		//		if (activeIds.size() == 0)
-		//			break;
-
-		//		vector<int> newIds;
-
-		//		for (int id : activeIds)
-		//		{
-		//			if (states[k].ids.find(id) != states[k].ids.end())
-		//			{
-		//				cv::line(display, states[k + 1].markers[states[k + 1].ids[id]], states[k].markers[states[k].ids[id]], colorPalette[id % colorPalette.size()]);
-		//				newIds.push_back(id);
-		//			}
-		//		}
-
-		//		activeIds = newIds;
-		//	}
-		//}
-
+		if (qShowMarkers)
+		{
+			for (int i = 0; i < currMarkers.size(); i++)
+			{
+				cv::circle(display, currMarkers[i] * scalingFactor, 4, Scalar{0, 0, 255}, -1);
+			}
+		}
 		if (qShowTransitions && frameIndex > 0)
 		{
-			drawStateTransitions(display, states[frameIndex - 1], states[frameIndex]);
+			drawStateTransitions(display, states[frameIndex - 1], states[frameIndex], scalingFactor);
 		}
 		if (qShowIds)
 		{
@@ -606,18 +574,60 @@ int main(int argc, char *argv[])
 			{
 				int id = p.first;
 				Point2f position = states[frameIndex].markers[p.second];
-				cv::putText(display, std::to_string(id), position, cv::FONT_HERSHEY_SIMPLEX, 0.5, Scalar{0, 0, 0}, 3);
-				cv::putText(display, std::to_string(id), position, cv::FONT_HERSHEY_SIMPLEX, 0.5, Scalar{255, 255, 255});
+				cv::putText(display, std::to_string(id), position * scalingFactor, cv::FONT_HERSHEY_SIMPLEX, 0.5, Scalar{0, 0, 0}, 3);
+				cv::putText(display, std::to_string(id), position * scalingFactor, cv::FONT_HERSHEY_SIMPLEX, 0.5, Scalar{255, 255, 255});
+			}
+		}
+		if (qShowTrails)
+		{
+			const vector<Scalar> colorPalette = {
+				{180, 119, 31},
+				{14, 127, 255},
+				{44, 160, 44},
+				{40, 39, 214},
+				{189, 103, 148},
+				{75, 86, 140},
+				{194, 119, 227},
+				{127, 127, 127},
+				{34, 189, 188},
+				{207, 190, 23},
+			};
+
+			vector<int> activeIds;
+
+			for (pair<int, int> p : states[frameIndex].ids)
+				activeIds.push_back(p.first);
+
+			for (int k = frameIndex - 1; k >= 0 && frameIndex - k < 30; k--)
+			{
+				if (activeIds.size() == 0)
+					break;
+
+				vector<int> newIds;
+
+				for (int id : activeIds)
+				{
+					if (states[k].ids.find(id) != states[k].ids.end())
+					{
+						Point2f from = states[k + 1].markers[states[k + 1].ids[id]];
+						Point2f to = states[k].markers[states[k].ids[id]];
+						Scalar color = colorPalette[id % colorPalette.size()];
+						cv::line(display, from * scalingFactor, to * scalingFactor, color, std::floor(scalingFactor));
+						newIds.push_back(id);
+					}
+				}
+
+				activeIds = newIds;
 			}
 		}
 
 		cv::imshow("w", display);
-		cv::setWindowTitle("w", "Active trackers: " + std::to_string(states[frameIndex].ids.size()));
+		cv::setWindowTitle("w", "Active trackers: " + std::to_string(states[frameIndex].ids.size()) + " Frame: " + std::to_string(frameIndex));
 
 		if (playing)
 			frameIndex = std::min(frameIndex + 1, frameCount - 1);
 
-		int pressedKey = cv::waitKey(playing ? 60 : 0);
+		int pressedKey = cv::waitKey(playing ? 30 : 0);
 
 		switch (pressedKey)
 		{
@@ -649,6 +659,12 @@ int main(int argc, char *argv[])
 			break;
 		case 'n':
 			qShowIds = !qShowIds;
+			break;
+		case 'm':
+			qShowMarkers = !qShowMarkers;
+			break;
+		case 'r':
+			qShowTrails = !qShowTrails;
 			break;
 		default:
 			break;
