@@ -348,9 +348,26 @@ int main(int argc, char *argv[])
 				// An actual tracker and not just a probability
 				bool sureTracker = states[t - 1].ids.find(tracker.id) != states[t - 1].ids.end();
 
+				auto calcWeight = [](Tracker t, Edge e) -> float
+				{
+					float magT = std::sqrt(t.dir.x * t.dir.x + t.dir.y * t.dir.y);
+					float magE = std::sqrt(e.dir.x * e.dir.x + e.dir.y * e.dir.y);
+
+					float weight = 2 + t.dir.dot(e.dir) / std::max(magT, 0.01f) / std::max(magE, 0.01f);
+
+					return weight;
+				};
+
+				float totalWeight = 0;
+
 				for (Edge e : edges)
 				{
-					float newProb = tracker.prob / edges.size();
+					totalWeight += calcWeight(tracker, e);
+				}
+
+				for (Edge e : edges)
+				{
+					float newProb = tracker.prob * calcWeight(tracker, e) / totalWeight;
 
 					newProb *= 0.97f;
 
