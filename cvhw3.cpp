@@ -125,7 +125,7 @@ void drawStateTransitions(Mat &on, const FrameState& first, const FrameState& se
 	for (pair<int, Edge> transition : second.mov)
 	{
 		Edge e = transition.second;
-		cv::arrowedLine(on, first.markers[e.from] * scalingFactor, second.markers[e.to] * scalingFactor, Scalar{0, 255, 0});
+		cv::arrowedLine(on, first.markers[e.from] * scalingFactor, second.markers[e.to] * scalingFactor, Scalar{0, 255, 0}, std::floor(scalingFactor));
 	}
 }
 
@@ -343,15 +343,18 @@ int main(int argc, char *argv[])
 				edges.push_back(e->second);
 			}
 
-			for (Tracker t : lastTrackers[i])
+			for (Tracker tracker : lastTrackers[i])
 			{
+				// An actual tracker and not just a probability
+				bool sureTracker = states[t - 1].ids.find(tracker.id) != states[t - 1].ids.end();
+
 				for (Edge e : edges)
 				{
-					float newProb = t.prob / edges.size();
+					float newProb = tracker.prob / edges.size();
 
 					newProb *= 0.97f;
 
-					auto it = std::find_if(currTrackers[e.to].begin(), currTrackers[e.to].end(), [t](Tracker other) { return other.id == t.id; });
+					auto it = std::find_if(currTrackers[e.to].begin(), currTrackers[e.to].end(), [tracker](Tracker other) { return other.id == tracker.id; });
 
 					if (newProb >= 0.05)
 					{
@@ -361,7 +364,13 @@ int main(int argc, char *argv[])
 						}
 						else
 						{
-							currTrackers[e.to].push_back(Tracker{t.id, newProb});
+							Tracker newTracker{tracker.id, newProb, tracker.dir};
+							if (sureTracker)
+							{
+								newTracker.dir = 0.4 * newTracker.dir + 0.6 * e.dir;
+								newTracker.dir /= std::max(std::max(std::abs(newTracker.dir.x), std::abs(newTracker.dir.y)), 0.1f);
+							}
+							currTrackers[e.to].push_back(newTracker);
 						}
 					}
 				}
@@ -513,6 +522,7 @@ int main(int argc, char *argv[])
 	bool qShowIds = true;
 	bool qShowTrails = true;
 	bool qShowMarkerIds = false;
+	bool qShowVelocities = false;
 
 	float scalingFactor = 2;
 
@@ -562,6 +572,7 @@ int main(int argc, char *argv[])
 				Mat valueMat{1, 1, CV_8U};
 				valueMat.setTo(t * 256 / historyLength);
 				Mat colorMat{1, 1, CV_8UC3};
+				// TODO(Andrey): Apply colormap to grayscale image
 				cv::applyColorMap(valueMat, colorMat, cv::COLORMAP_JET);
 				Scalar color{colorMat.at<cv::Vec3b>()};
 
@@ -676,6 +687,21 @@ int main(int argc, char *argv[])
 				cv::putText(display, std::to_string(i), marker * scalingFactor, cv::FONT_HERSHEY_SIMPLEX, 0.5, Scalar{0, 255, 255});
 			}
 		}
+		if (qShowVelocities)
+		{
+			for (int i = 0; i < (int)states[frameIndex].trackers.size(); i++)
+			{
+				Point2f marker = states[frameIndex].markers[i];
+
+				for (Tracker t : states[frameIndex].trackers[i])
+				{
+					if (states[frameIndex].ids.find(t.id) != states[frameIndex].ids.end())
+					{
+						cv::arrowedLine(display, marker * scalingFactor, (marker + t.dir * 20) * scalingFactor, Scalar{244, 134, 66}, std::floor(scalingFactor));
+					}
+				}
+			}
+		}
 
 		cv::imshow("w", display);
 		cv::setWindowTitle("w", "Active trackers: " + std::to_string(states[frameIndex].ids.size()) + " Frame: " + std::to_string(frameIndex));
@@ -721,8 +747,12 @@ int main(int argc, char *argv[])
 			break;
 		case 'r':
 			qShowTrails = !qShowTrails;
+			break;
 		case 'd':
 			qShowMarkerIds = !qShowMarkerIds;
+			break;
+		case 'v':
+			qShowVelocities = !qShowVelocities;
 			break;
 		default:
 			break;
