@@ -18,6 +18,7 @@ using cv::Mat1i;
 using cv::Mat1f;
 using cv::Mat1d;
 using cv::Mat1s;
+using cv::Matx22f;
 
 using cv::Scalar;
 using cv::InputArray;
@@ -110,6 +111,7 @@ struct Tracker
 struct FrameState
 {
 	vector<Point2f> markers;
+	vector<Matx22f> covar;
 
 	// How the markers from the last frame moved
 	multimap<int, Edge> mov;
@@ -127,6 +129,40 @@ void drawStateTransitions(Mat &on, const FrameState& first, const FrameState& se
 		Edge e = transition.second;
 		cv::arrowedLine(on, first.markers[e.from] * scalingFactor, second.markers[e.to] * scalingFactor, Scalar{0, 255, 0}, std::floor(scalingFactor));
 	}
+}
+
+// Taken from: http://www.visiondummy.com/2014/04/draw-error-ellipse-representing-covariance-matrix/
+
+// Chi-Square table is: https://people.richland.edu/james/lecture/m170/tbl-chi.html
+// The square root of the probability is passed
+
+// Modified: Now expects float matrix instead of double
+
+cv::RotatedRect getErrorEllipse(double chisquare_val, cv::Point2f mean, cv::Mat covmat) {
+
+	//Get the eigenvalues and eigenvectors
+	cv::Mat eigenvalues, eigenvectors;
+	cv::eigen(covmat, eigenvalues, eigenvectors);
+
+	//Calculate the angle between the largest eigenvector and the x-axis
+	double angle = atan2(eigenvectors.at<float>(0, 1), eigenvectors.at<float>(0, 0));
+
+	//Shift the angle to the [0, 2pi] interval instead of [-pi, pi]
+	if (angle < 0)
+		angle += 6.28318530718;
+
+	//Conver to degrees instead of radians
+	angle = 180 * angle / 3.14159265359;
+
+	//Calculate the size of the minor and major axes
+	double halfmajoraxissize = chisquare_val*sqrt(eigenvalues.at<float>(0));
+	double halfminoraxissize = chisquare_val*sqrt(eigenvalues.at<float>(1));
+
+	//Return the oriented ellipse
+	//The -angle is used because OpenCV defines the angle clockwise instead of anti-clockwise
+	// NOTE(Andrey): Modified because for us Y axis is down)
+	return cv::RotatedRect(mean, cv::Size2f(halfmajoraxissize, halfminoraxissize), angle);
+
 }
 
 int main(int argc, char *argv[])
@@ -204,10 +240,8 @@ int main(int argc, char *argv[])
 		return markerMask;
 	};
 
-	auto getFrameMarkers = [](const Mat &markerMask) -> vector<Point2f>
+	auto getFrameMarkers = [](const Mat &markerMask, vector<Point2f> &outMean, vector<Matx22f> &outCovar)
 	{
-		vector<Point2f> markers;
-
 		Mat labels;
 		Mat stats;
 		Mat1d centroids;
@@ -216,19 +250,64 @@ int main(int argc, char *argv[])
 			markerMask,
 			labels,
 			stats,
-			centroids);
+			centroids,
+			4, CV_32S);
 
 		// NOTE: label 0 is the background. We ignore it here.
+
+		vector<Point2f> ccMean(std::max(centroids.rows - 1, 0));
+		vector<Matx22f> ccCovar(ccMean.size(), Matx22f{0, 0, 0, 0});
+
+		for (int r = 1; r < centroids.rows; r++)
+			ccMean[r - 1] = Point2f{(float)centroids(r, 0), (float)centroids(r, 1)};
+
+		for (int r = 0; r < labels.rows; r++)
+		{
+			int *ptr = labels.ptr<int>(r);
+
+			for (int c = 0; c < labels.cols; c++, ptr++)
+			{
+				if (*ptr == 0)
+					continue;
+
+				int id = *ptr - 1;
+
+				Point2f mean = ccMean[id];
+				Matx22f covar = ccCovar[id];
+
+				covar(0, 0) += (c - mean.x) * (c - mean.x);
+				covar(0, 1) += (c - mean.x) * (r - mean.y);
+				covar(1, 0) += (r - mean.y) * (c - mean.x);
+				covar(1, 1) += (r - mean.y) * (r - mean.y);
+
+				ccCovar[id] = covar;
+			}
+		}
+
+		for (int r = 1; r < stats.rows; r++)
+		{
+			int count = stats.at<int>(r, cv::CC_STAT_AREA);
+
+			if (count > 0)
+			{
+				ccCovar[r - 1](0, 0) /= count;
+				ccCovar[r - 1](0, 1) /= count;
+				ccCovar[r - 1](1, 0) /= count;
+				ccCovar[r - 1](1, 1) /= count;
+			}
+		}
+
+		outMean.resize(0);
+		outCovar.resize(0);
 
 		for (int r = 1; r < centroids.rows; r++)
 		{
 			if (stats.at<int>(r, cv::CC_STAT_AREA) > 20)
 			{
-				markers.push_back(Point2f{(float)centroids(r, 0), (float)centroids(r, 1)});
+				outMean.push_back(ccMean[r - 1]);
+				outCovar.push_back(ccCovar[r - 1]);
 			}
 		}
-
-		return markers;
 	};
 
 	vector<Mat> frames;
@@ -265,7 +344,10 @@ int main(int argc, char *argv[])
 		Mat foreground = getForeground(frames[t], background);
 		Mat markerMask = getMarkerMask(foreground);
 
-		vector<Point2f> currMarkers = getFrameMarkers(markerMask);
+
+		vector<Point2f> currMarkers;
+		getFrameMarkers(markerMask, currMarkers, states[t].covar);
+
 		vector<Point2f> lastMarkers = t > 0 ? states[t - 1].markers : vector<Point2f>{};
 
 		vector<vector<Tracker>> emptyTrackers;
@@ -540,6 +622,7 @@ int main(int argc, char *argv[])
 	bool qShowTrails = true;
 	bool qShowMarkerIds = false;
 	bool qShowVelocities = false;
+	bool qShowCovar = false;
 
 	float scalingFactor = 2;
 
@@ -632,6 +715,18 @@ int main(int argc, char *argv[])
 
 		cv::resize(display, display, Size{(int)(display.cols * scalingFactor), (int)(display.rows * scalingFactor)});
 
+		if (qShowCovar)
+		{
+			for (int i = 0; i < (int)states[frameIndex].markers.size(); i++)
+			{
+				float chi_square_95_percent = 2.4477f;
+				cv::RotatedRect rect = getErrorEllipse(chi_square_95_percent + 1, states[frameIndex].markers[i], Mat{states[frameIndex].covar[i]});
+				rect.center *= scalingFactor;
+				rect.size *= scalingFactor;
+				cv::ellipse(display, rect, Scalar{0, 0, 0}, 3);
+				cv::ellipse(display, rect, Scalar{0, 200, 200}, 2);
+			}
+		}
 		if (qShowTrails)
 		{
 			const vector<Scalar> colorPalette = {
@@ -771,6 +866,8 @@ int main(int argc, char *argv[])
 		case 'v':
 			qShowVelocities = !qShowVelocities;
 			break;
+		case 'c':
+			qShowCovar = !qShowCovar;
 		default:
 			break;
 		}
