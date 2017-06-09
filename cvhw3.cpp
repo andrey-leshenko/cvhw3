@@ -19,6 +19,8 @@ using cv::Mat1f;
 using cv::Mat1d;
 using cv::Mat1s;
 using cv::Matx22f;
+using cv::Matx44f;
+using cv::Vec4f;
 
 using cv::Scalar;
 using cv::InputArray;
@@ -29,6 +31,7 @@ using cv::Rect;
 using cv::Size;
 using cv::String;
 using cv::VideoCapture;
+using cv::KalmanFilter;
 
 #define QQQ do {std::cerr << "QQQ " << __FUNCTION__ << " " << __LINE__ << std::endl;} while(0)
 
@@ -92,11 +95,18 @@ struct Edge
 	{ }
 };
 
+struct KalmanState
+{
+	Vec4f mean;
+	Matx44f covar;
+};
+
 struct Tracker
 {
 	int id;
 	float prob;
 	Point2f dir;
+	KalmanState kalman;
 
 	Tracker(int id = 0, float prob = 1, Point2f dir = Point2f{0, 0})
 		: id{id}, prob{prob}, dir{dir}
@@ -322,6 +332,15 @@ int main(int argc, char *argv[])
 
 			// TODO: Work with color video
 			cv::cvtColor(frame, frame, cv::COLOR_BGR2GRAY);
+
+			if (frames.size() > 0)
+			{
+				Mat diff;
+				cv::absdiff(frame, frames.back(), diff);
+				if (cv::countNonZero(diff > 10) <= 50)
+					continue;
+			}
+
 			frames.push_back(frame);
 			std::cout << "Loaded frame " << i++ << std::endl;
 		}
@@ -334,6 +353,74 @@ int main(int argc, char *argv[])
 
 	vector<FrameState> states(frames.size());
 	int idCount = 0;
+
+	//
+	// Create Kalman Filter
+	//
+
+	KalmanFilter kalmanFilter;
+
+	{
+		// State: [px, py, vx, vy]
+		// Measurement: [px, py]
+		kalmanFilter.init(4, 2);
+
+		// Transition matrix:
+		// [1	0	dt	0]
+		// [0	1	0	dt]
+		// [0	0	1	0]
+		// [0	0	0	1]
+		//
+		// The matrix is initialized by Mat::eye, we only need to set the time delta.
+		// We set the dt to 1 time unit;
+		kalmanFilter.transitionMatrix.at<float>(0, 2) = 1;
+		kalmanFilter.transitionMatrix.at<float>(1, 3) = 1;
+
+		// Measurement matrix:
+		// [1	0	0	0]
+		// [0	1	0	0]
+		kalmanFilter.measurementMatrix.at<float>(0, 0) = 1;
+		kalmanFilter.measurementMatrix.at<float>(1, 1) = 1;
+
+		// Process noise covariance:
+		// [epx	0	0	0]
+		// [0	epy	0	0]
+		// [0	0	evx	0]
+		// [0	0	0	evy]
+		kalmanFilter.processNoiseCov.at<float>(0, 0) = 0.01f;
+		kalmanFilter.processNoiseCov.at<float>(1, 1) = 0.01f;
+		kalmanFilter.processNoiseCov.at<float>(2, 2) = 1.0f * 10;
+		kalmanFilter.processNoiseCov.at<float>(3, 3) = 1.0f * 10;
+	}
+
+	auto updateKalman = [&kalmanFilter](KalmanState currState, Point2f measurement, Matx22f measurementCov) -> KalmanState
+	{
+		// Copy state into the Kalman Filter
+		for (int i = 0; i < 4; i++)
+			kalmanFilter.statePost.at<float>(i) = currState.mean[i];
+		for (int i = 0; i < 4; i++)
+			for (int k = 0; k < 4; k++)
+				kalmanFilter.errorCovPost.at<float>(i, k) = currState.covar(i, k);
+
+		// Predict
+		kalmanFilter.predict();
+
+		// Correct
+		for (int i = 0; i < 2; i++)
+			for (int k = 0; k < 2; k++)
+				kalmanFilter.measurementNoiseCov.at<float>(i, k) = measurementCov(i, k);
+
+		kalmanFilter.correct(Mat{measurement, false});
+
+		// Copy state out of the Kalman Filter
+		for (int i = 0; i < 4; i++)
+			currState.mean[i] = kalmanFilter.statePost.at<float>(i);
+		for (int i = 0; i < 4; i++)
+			for (int k = 0; k < 4; k++)
+				currState.covar(i, k) = kalmanFilter.errorCovPost.at<float>(i, k);
+
+		return currState;
+	};
 
 	for (int t = 0; t < frameCount; t++)
 	{
@@ -432,10 +519,11 @@ int main(int argc, char *argv[])
 
 				auto calcWeight = [](Tracker t, Edge e) -> float
 				{
-					float magT = std::sqrt(t.dir.x * t.dir.x + t.dir.y * t.dir.y);
+					Point2f tDir{t.kalman.mean[2], t.kalman.mean[3]};
+					float magT = std::sqrt(tDir.x * tDir.x + tDir.y * tDir.y);
 					float magE = std::sqrt(e.dir.x * e.dir.x + e.dir.y * e.dir.y);
 
-					float weight = 2 + t.dir.dot(e.dir) / std::max(magT, 0.01f) / std::max(magE, 0.01f);
+					float weight = 2 + tDir.dot(e.dir) / std::max(magT, 0.01f) / std::max(magE, 0.01f);
 
 					return weight;
 				};
@@ -464,6 +552,9 @@ int main(int argc, char *argv[])
 						else
 						{
 							Tracker newTracker{tracker.id, newProb, tracker.dir};
+
+							newTracker.kalman = updateKalman(tracker.kalman, currMarkers[e.to], states[t].covar[e.to]);
+
 							if (sureTracker)
 							{
 								newTracker.dir = 0.4 * newTracker.dir + 0.6 * e.dir;
@@ -581,7 +672,10 @@ int main(int argc, char *argv[])
 			if (currTrackers[i].empty())
 			{
 				int newId = idCount++;
-				currTrackers[i].push_back(Tracker{newId});
+				Tracker tracker{newId};
+				tracker.kalman.mean = Vec4f{currMarkers[i].x, currMarkers[i].y, 0, 0};
+				tracker.kalman.covar = Matx44f::zeros();
+				currTrackers[i].push_back(tracker);
 				states[t].ids[newId] = i;
 			}
 		}
@@ -622,7 +716,8 @@ int main(int argc, char *argv[])
 	bool qShowTrails = true;
 	bool qShowMarkerIds = false;
 	bool qShowVelocities = false;
-	bool qShowCovar = false;
+	bool qShowMarkerCovar = false;
+	bool qShowTrackerCovar = false;
 
 	float scalingFactor = 2;
 
@@ -715,16 +810,42 @@ int main(int argc, char *argv[])
 
 		cv::resize(display, display, Size{(int)(display.cols * scalingFactor), (int)(display.rows * scalingFactor)});
 
-		if (qShowCovar)
+		if (qShowMarkerCovar)
 		{
 			for (int i = 0; i < (int)states[frameIndex].markers.size(); i++)
 			{
 				float chi_square_95_percent = 2.4477f;
-				cv::RotatedRect rect = getErrorEllipse(chi_square_95_percent + 1, states[frameIndex].markers[i], Mat{states[frameIndex].covar[i]});
+				cv::RotatedRect rect = getErrorEllipse(chi_square_95_percent + 1, states[frameIndex].markers[i], Mat{states[frameIndex].covar[i], false});
 				rect.center *= scalingFactor;
 				rect.size *= scalingFactor;
 				cv::ellipse(display, rect, Scalar{0, 0, 0}, 3);
 				cv::ellipse(display, rect, Scalar{0, 200, 200}, 2);
+			}
+		}
+		if (qShowTrackerCovar)
+		{
+			for (const vector<Tracker> &vec : states[frameIndex].trackers)
+			{
+				for (const Tracker &tracker : vec)
+				{
+					if (states[frameIndex].ids.find(tracker.id) == states[frameIndex].ids.end())
+						continue;
+
+					Point2f mean{tracker.kalman.mean[0], tracker.kalman.mean[1]};
+					Matx22f covar{tracker.kalman.covar(0, 0), tracker.kalman.covar(0, 1), tracker.kalman.covar(1, 0), tracker.kalman.covar(1, 1)};
+
+					{
+						float chi_square_95_percent = 2.4477f;
+						cv::RotatedRect rect = getErrorEllipse(chi_square_95_percent + 1, mean, Mat{covar});
+						rect.center *= scalingFactor;
+						rect.size *= scalingFactor;
+						cv::ellipse(display, rect, Scalar{0, 0, 0}, 3);
+						cv::ellipse(display, rect, Scalar{244, 80, 66}, 2);
+					}
+
+					cv::arrowedLine(display, mean * scalingFactor,
+						(mean + Point2f{tracker.kalman.mean[2], tracker.kalman.mean[3]} * 4) * scalingFactor, Scalar{225, 142, 170}, 2);
+				}
 			}
 		}
 		if (qShowTrails)
@@ -867,7 +988,11 @@ int main(int argc, char *argv[])
 			qShowVelocities = !qShowVelocities;
 			break;
 		case 'c':
-			qShowCovar = !qShowCovar;
+			qShowMarkerCovar = !qShowMarkerCovar;
+			break;
+		case 'C':
+			qShowTrackerCovar = !qShowTrackerCovar;
+			break;
 		default:
 			break;
 		}
