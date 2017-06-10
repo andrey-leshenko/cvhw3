@@ -83,18 +83,6 @@ Mat videoMedian(const vector<Mat> &images)
 	return median;
 }
 
-struct Edge
-{
-	int from;
-	int to;
-	Point2f dir;
-	float weight;
-
-	Edge(int from, int to, Point2f dir, float weight = 1)
-		: from{from}, to{to}, dir{dir}, weight{weight}
-	{ }
-};
-
 struct KalmanState
 {
 	Vec4f mean;
@@ -124,20 +112,21 @@ struct FrameState
 	vector<Matx22f> covar;
 
 	// How the markers from the last frame moved
-	multimap<int, Edge> mov;
-	multimap<int, Edge> imov;
+	multimap<int, int> mov;
+	multimap<int, int> imov;
 
 	//multimap<int, Tracker> trackers;
 	vector<vector<Tracker>> trackers;
 	map<int, int> ids;
+
+	int firstNewId;
 };
 
 void drawStateTransitions(Mat &on, const FrameState& first, const FrameState& second, float scalingFactor = 1)
 {
-	for (pair<int, Edge> transition : second.mov)
+	for (pair<int, int> transition : second.mov)
 	{
-		Edge e = transition.second;
-		cv::arrowedLine(on, first.markers[e.from] * scalingFactor, second.markers[e.to] * scalingFactor, Scalar{0, 255, 0}, std::floor(scalingFactor));
+		cv::arrowedLine(on, first.markers[transition.first] * scalingFactor, second.markers[transition.second] * scalingFactor, Scalar{0, 255, 0}, std::floor(scalingFactor));
 	}
 }
 
@@ -393,7 +382,7 @@ int main(int argc, char *argv[])
 		kalmanFilter.processNoiseCov.at<float>(3, 3) = 1.0f * 10;
 	}
 
-	auto updateKalman = [&kalmanFilter](KalmanState currState, Point2f measurement, Matx22f measurementCov) -> KalmanState
+	auto updateKalman = [&kalmanFilter](KalmanState currState, Point2f measurement, Matx22f measurementCov, float *outDist) -> KalmanState
 	{
 		// Copy state into the Kalman Filter
 		for (int i = 0; i < 4; i++)
@@ -404,6 +393,30 @@ int main(int argc, char *argv[])
 
 		// Predict
 		kalmanFilter.predict();
+
+		if (outDist)
+		{
+			Point2f velocity{currState.mean[2], currState.mean[3]};
+			Point2f direction{measurement.x - currState.mean[0], measurement.y - currState.mean[1]};
+			float magV = std::sqrt(velocity.x * velocity.x + velocity.y * velocity.y);
+			float magD = std::sqrt(direction.x * direction.x + direction.y * direction.y);
+
+			float cosTheta = velocity.dot(direction) / std::max(magV, 0.01f) / std::max(magD, 0.01f);
+
+			// Mahalanobis distance https://en.wikipedia.org/wiki/Mahalanobis_distance
+			// between predicted position and measured position.
+			float predictedX = kalmanFilter.statePre.at<float>(0);
+			float predictedY = kalmanFilter.statePre.at<float>(1);
+
+			predictedX -= measurement.x;
+			predictedY -= measurement.y;
+
+			*outDist = std::sqrt(
+				predictedX * (measurementCov(0, 0) * predictedX + measurementCov(0, 1) * predictedY) +
+				predictedY * (measurementCov(1, 0) * predictedX + measurementCov(1, 1) * predictedY));
+
+			*outDist *= 5 - cosTheta;
+		}
 
 		// Correct
 		for (int i = 0; i < 2; i++)
@@ -446,8 +459,6 @@ int main(int argc, char *argv[])
 		// Create the transition graph
 		//
 
-		vector<std::tuple<float, int, int>> distList;
-
 		for (int i = 0; i < lastMarkers.size(); i++)
 		{
 			for (int k = 0; k < currMarkers.size(); k++)
@@ -461,36 +472,8 @@ int main(int argc, char *argv[])
 
 				if (squareDist <= lowThresh)
 				{
-					distList.push_back({squareDist, i, k});
-				}
-			}
-		}
-
-		std::sort(distList.begin(), distList.end());
-
-		vector<bool> lastConnected(lastMarkers.size(), false);
-		vector<bool> currConnected(currMarkers.size(), false);
-
-		for (int iter = 0; iter < 2; iter++)
-		{
-			for (tuple<float, int, int> d : distList)
-			{
-				float distance;
-				int i, k;
-
-				std::tie(distance, i, k) = d;
-
-				if ((iter == 0 && !lastConnected[i]) ||
-					(iter == 1 && !currConnected[k]))
-				{
-					Edge edge{i, k, currMarkers[k] - lastMarkers[i]};
-					states[t].mov.insert({i, edge});
-
-					Edge inverseEdge{k, i, lastMarkers[i] - currMarkers[k]};
-					states[t].imov.insert({k, inverseEdge});
-
-					lastConnected[i] = true;
-					currConnected[k] = true;
+					states[t].mov.insert({i, k});
+					states[t].imov.insert({k, i});
 				}
 			}
 		}
@@ -505,62 +488,47 @@ int main(int argc, char *argv[])
 		{
 			auto edgeRange = states[t].mov.equal_range(i);
 
-			vector<Edge> edges;
+			vector<int> edges;
 
 			for (auto e = edgeRange.first; e != edgeRange.second; e++)
-			{
 				edges.push_back(e->second);
-			}
+
+			vector<KalmanState> kalmanStates(edges.size());
+			vector<float> weights(edges.size());
 
 			for (Tracker tracker : lastTrackers[i])
 			{
-				// An actual tracker and not just a probability
-				bool sureTracker = states[t - 1].ids.find(tracker.id) != states[t - 1].ids.end();
-
-				auto calcWeight = [](Tracker t, Edge e) -> float
-				{
-					Point2f tDir{t.kalman.mean[2], t.kalman.mean[3]};
-					float magT = std::sqrt(tDir.x * tDir.x + tDir.y * tDir.y);
-					float magE = std::sqrt(e.dir.x * e.dir.x + e.dir.y * e.dir.y);
-
-					float weight = 2 + tDir.dot(e.dir) / std::max(magT, 0.01f) / std::max(magE, 0.01f);
-
-					return weight;
-				};
-
 				float totalWeight = 0;
 
-				for (Edge e : edges)
+				for (int i = 0; i < (int)edges.size(); i++)
 				{
-					totalWeight += calcWeight(tracker, e);
+					float distance;
+					kalmanStates[i] = updateKalman(tracker.kalman, currMarkers[edges[i]], states[t].covar[edges[i]], &distance);
+					weights[i] = 1 / std::max(distance, 0.1f);
+					totalWeight += weights[i];
 				}
 
-				for (Edge e : edges)
+				for (int i = 0; i < edges.size(); i++)
 				{
-					float newProb = tracker.prob * calcWeight(tracker, e) / totalWeight;
-
+					int targetMarker = edges[i];
+					float newProb = tracker.prob * weights[i] / totalWeight;
 					newProb *= 0.97f;
 
-					auto it = std::find_if(currTrackers[e.to].begin(), currTrackers[e.to].end(), [tracker](Tracker other) { return other.id == tracker.id; });
+					auto it = std::find_if(currTrackers[targetMarker].begin(), currTrackers[targetMarker].end(), [tracker](Tracker other) { return other.id == tracker.id; });
 
-					if (newProb >= 0.05)
+					if (newProb >= 0.005)
 					{
-						if (it != currTrackers[e.to].end())
+						if (it != currTrackers[targetMarker].end())
 						{
+							it->kalman.mean = (it->kalman.mean * it->prob + kalmanStates[i].mean * newProb) / (it->prob + newProb);
+							it->kalman.covar = (it->kalman.covar * it->prob + kalmanStates[i].covar * newProb) * (1 / (it->prob + newProb));
 							it->prob += newProb;
 						}
 						else
 						{
 							Tracker newTracker{tracker.id, newProb, tracker.dir};
-
-							newTracker.kalman = updateKalman(tracker.kalman, currMarkers[e.to], states[t].covar[e.to]);
-
-							if (sureTracker)
-							{
-								newTracker.dir = 0.4 * newTracker.dir + 0.6 * e.dir;
-								newTracker.dir /= std::max(std::max(std::abs(newTracker.dir.x), std::abs(newTracker.dir.y)), 0.1f);
-							}
-							currTrackers[e.to].push_back(newTracker);
+							newTracker.kalman = kalmanStates[i];
+							currTrackers[targetMarker].push_back(newTracker);
 						}
 					}
 				}
@@ -620,8 +588,7 @@ int main(int argc, char *argv[])
 
 					for (auto p = positionRange.first; p != positionRange.second; p++)
 					{
-						Edge edge = p->second;
-						int targetMarker = edge.to;
+						int targetMarker = p->second;
 
 						for (Tracker t : states[i].trackers[targetMarker])
 						{
@@ -643,13 +610,13 @@ int main(int argc, char *argv[])
 			}
 		}
 
-		for (auto t : allTrackers)
+		for (auto item : allTrackers)
 		{
 			float prob;
 			int marker;
 			Tracker tracker;
 
-			std::tie(prob, marker, tracker) = t;
+			std::tie(prob, marker, tracker) = item;
 
 			if (std::find(usedIds.begin(), usedIds.end(), tracker.id) == usedIds.end())
 				newTrackers.push_back({marker, tracker});
@@ -657,15 +624,14 @@ int main(int argc, char *argv[])
 
 		for (auto &v : currTrackers)
 			v.resize(0);
-
 		for (pair<int, Tracker> t : newTrackers)
-		{
 			currTrackers[t.first].push_back(t.second);
-		}
 
 		//
 		// Assign ids to empty markers
 		//
+
+		states[t].firstNewId = idCount;
 
 		for (int i = 0; i < (int)currTrackers.size(); i++)
 		{
@@ -708,12 +674,12 @@ int main(int argc, char *argv[])
 #endif
 
 	bool playing = true;
-	int mode = 5;
+	int mode = 4;
 
 	bool qShowMarkers = true;
-	bool qShowTransitions = true;
+	bool qShowTransitions = false;
 	bool qShowIds = true;
-	bool qShowTrails = true;
+	bool qShowTrails = false;
 	bool qShowMarkerIds = false;
 	bool qShowVelocities = false;
 	bool qShowMarkerCovar = false;
@@ -810,44 +776,6 @@ int main(int argc, char *argv[])
 
 		cv::resize(display, display, Size{(int)(display.cols * scalingFactor), (int)(display.rows * scalingFactor)});
 
-		if (qShowMarkerCovar)
-		{
-			for (int i = 0; i < (int)states[frameIndex].markers.size(); i++)
-			{
-				float chi_square_95_percent = 2.4477f;
-				cv::RotatedRect rect = getErrorEllipse(chi_square_95_percent + 1, states[frameIndex].markers[i], Mat{states[frameIndex].covar[i], false});
-				rect.center *= scalingFactor;
-				rect.size *= scalingFactor;
-				cv::ellipse(display, rect, Scalar{0, 0, 0}, 3);
-				cv::ellipse(display, rect, Scalar{0, 200, 200}, 2);
-			}
-		}
-		if (qShowTrackerCovar)
-		{
-			for (const vector<Tracker> &vec : states[frameIndex].trackers)
-			{
-				for (const Tracker &tracker : vec)
-				{
-					if (states[frameIndex].ids.find(tracker.id) == states[frameIndex].ids.end())
-						continue;
-
-					Point2f mean{tracker.kalman.mean[0], tracker.kalman.mean[1]};
-					Matx22f covar{tracker.kalman.covar(0, 0), tracker.kalman.covar(0, 1), tracker.kalman.covar(1, 0), tracker.kalman.covar(1, 1)};
-
-					{
-						float chi_square_95_percent = 2.4477f;
-						cv::RotatedRect rect = getErrorEllipse(chi_square_95_percent + 1, mean, Mat{covar});
-						rect.center *= scalingFactor;
-						rect.size *= scalingFactor;
-						cv::ellipse(display, rect, Scalar{0, 0, 0}, 3);
-						cv::ellipse(display, rect, Scalar{244, 80, 66}, 2);
-					}
-
-					cv::arrowedLine(display, mean * scalingFactor,
-						(mean + Point2f{tracker.kalman.mean[2], tracker.kalman.mean[3]} * 4) * scalingFactor, Scalar{225, 142, 170}, 2);
-				}
-			}
-		}
 		if (qShowTrails)
 		{
 			const vector<Scalar> colorPalette = {
@@ -879,8 +807,22 @@ int main(int argc, char *argv[])
 				{
 					if (states[k].ids.find(id) != states[k].ids.end())
 					{
-						Point2f from = states[k + 1].markers[states[k + 1].ids[id]];
-						Point2f to = states[k].markers[states[k].ids[id]];
+						// TODO: Refactor
+						int fromMarker = states[k + 1].ids[id];
+						Vec4f from4 = std::find_if(
+							states[k + 1].trackers[fromMarker].begin(),
+							states[k + 1].trackers[fromMarker].end(),
+							[id](const Tracker &other) { return other.id == id; })->kalman.mean;
+
+						fromMarker = states[k].ids[id];
+						Vec4f to4 = std::find_if(
+							states[k].trackers[fromMarker].begin(),
+							states[k].trackers[fromMarker].end(),
+							[id](const Tracker &other) { return other.id == id; })->kalman.mean;
+
+						Point2f from{from4[0], from4[1]};
+						Point2f to{to4[0], to4[1]};
+
 						Scalar color = colorPalette[id % colorPalette.size()];
 						cv::line(display, from * scalingFactor, to * scalingFactor, color, std::floor(scalingFactor));
 						newIds.push_back(id);
@@ -888,6 +830,67 @@ int main(int argc, char *argv[])
 				}
 
 				activeIds = newIds;
+			}
+		}
+		if (qShowMarkerCovar)
+		{
+			for (int i = 0; i < (int)states[frameIndex].markers.size(); i++)
+			{
+				float chi_square_95_percent = 2.4477f;
+				cv::RotatedRect rect = getErrorEllipse(chi_square_95_percent + 1, states[frameIndex].markers[i], Mat{states[frameIndex].covar[i], false});
+				rect.center *= scalingFactor;
+				rect.size *= scalingFactor;
+				cv::ellipse(display, rect, Scalar{0, 0, 0}, 3);
+				cv::ellipse(display, rect, Scalar{0, 200, 200}, 2);
+			}
+		}
+		if (qShowTrackerCovar || qShowIds)
+		{
+			for (int i = 0; i < states[frameIndex].trackers.size(); i++)
+			{
+				for (const Tracker &tracker : states[frameIndex].trackers[i])
+				{
+					if (states[frameIndex].ids.find(tracker.id) == states[frameIndex].ids.end() ||
+						states[frameIndex].ids[tracker.id] != i)
+						continue;
+
+					Point2f mean{tracker.kalman.mean[0], tracker.kalman.mean[1]};
+					Matx22f covar{tracker.kalman.covar(0, 0), tracker.kalman.covar(0, 1), tracker.kalman.covar(1, 0), tracker.kalman.covar(1, 1)};
+
+					if (qShowTrackerCovar)
+					{
+						float chi_square_95_percent = 2.4477f;
+						cv::RotatedRect rect = getErrorEllipse(chi_square_95_percent + 1, mean, Mat{covar});
+						rect.center *= scalingFactor;
+						rect.size *= scalingFactor;
+						cv::ellipse(display, rect, Scalar{0, 0, 0}, 3);
+						cv::ellipse(display, rect, Scalar{244, 80, 66}, 2);
+
+						cv::arrowedLine(display, mean * scalingFactor,
+							(mean + Point2f{tracker.kalman.mean[2], tracker.kalman.mean[3]} *4) * scalingFactor, Scalar{225, 142, 170}, 2);
+					}
+
+					if (qShowIds)
+					{
+						Scalar color;
+
+						if (tracker.id >= states[frameIndex].firstNewId)
+						{
+							color = Scalar{44, 160, 44};
+						}
+						else if (frameIndex + 1 != frameCount && states[frameIndex + 1].ids.find(tracker.id) == states[frameIndex + 1].ids.end())
+						{
+							color = Scalar{40, 39, 214};
+						}
+						else
+						{
+							color = Scalar{255, 255, 255};
+						}
+
+						cv::putText(display, std::to_string(tracker.id), mean * scalingFactor, cv::FONT_HERSHEY_SIMPLEX, 0.5, Scalar{0, 0, 0}, 3);
+						cv::putText(display, std::to_string(tracker.id), mean * scalingFactor, cv::FONT_HERSHEY_SIMPLEX, 0.5, color);
+					}
+				}
 			}
 		}
 		if (qShowMarkers)
@@ -900,16 +903,6 @@ int main(int argc, char *argv[])
 		if (qShowTransitions && frameIndex > 0)
 		{
 			drawStateTransitions(display, states[frameIndex - 1], states[frameIndex], scalingFactor);
-		}
-		if (qShowIds)
-		{
-			for (auto p : states[frameIndex].ids)
-			{
-				int id = p.first;
-				Point2f position = states[frameIndex].markers[p.second];
-				cv::putText(display, std::to_string(id), position * scalingFactor, cv::FONT_HERSHEY_SIMPLEX, 0.5, Scalar{0, 0, 0}, 3);
-				cv::putText(display, std::to_string(id), position * scalingFactor, cv::FONT_HERSHEY_SIMPLEX, 0.5, Scalar{255, 255, 255});
-			}
 		}
 		if (qShowMarkerIds)
 		{
