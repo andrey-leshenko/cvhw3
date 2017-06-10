@@ -95,6 +95,8 @@ struct Tracker
 	float prob;
 	Point2f dir;
 	KalmanState kalman;
+	float distanceToLastSureMarker;
+	int prevMarker;
 
 	Tracker(int id = 0, float prob = 1, Point2f dir = Point2f{0, 0})
 		: id{id}, prob{prob}, dir{dir}
@@ -133,7 +135,7 @@ void drawStateTransitions(Mat &on, const FrameState& first, const FrameState& se
 // Taken from: http://www.visiondummy.com/2014/04/draw-error-ellipse-representing-covariance-matrix/
 
 // Chi-Square table is: https://people.richland.edu/james/lecture/m170/tbl-chi.html
-// The square root of the probability is passed
+// The square root of the probability is passed.
 
 // Modified: Now expects float matrix instead of double
 
@@ -161,7 +163,6 @@ cv::RotatedRect getErrorEllipse(double chisquare_val, cv::Point2f mean, cv::Mat 
 	//The -angle is used because OpenCV defines the angle clockwise instead of anti-clockwise
 	// NOTE(Andrey): Modified because for us Y axis is down)
 	return cv::RotatedRect(mean, cv::Size2f(halfmajoraxissize, halfminoraxissize), angle);
-
 }
 
 int main(int argc, char *argv[])
@@ -225,6 +226,12 @@ int main(int argc, char *argv[])
 			cv::getStructuringElement(cv::MORPH_ELLIPSE, Size{3, 3}),
 			cv::Point{-1, -1},
 			1);
+
+		//cv::dilate(markerMask,
+		//	markerMask,
+		//	cv::getStructuringElement(cv::MORPH_ELLIPSE, Size{3, 3}),
+		//	cv::Point{-1, -1},
+		//	1);
 
 		//cv::morphologyEx(markerMask,
 		//markerMask,
@@ -484,9 +491,9 @@ int main(int argc, char *argv[])
 
 		currTrackers = vector<vector<Tracker>>(currMarkers.size());
 
-		for (int i = 0; i < (int)lastTrackers.size(); i++)
+		for (int marker = 0; marker < (int)lastTrackers.size(); marker++)
 		{
-			auto edgeRange = states[t].mov.equal_range(i);
+			auto edgeRange = states[t].mov.equal_range(marker);
 
 			vector<int> edges;
 
@@ -496,7 +503,7 @@ int main(int argc, char *argv[])
 			vector<KalmanState> kalmanStates(edges.size());
 			vector<float> weights(edges.size());
 
-			for (Tracker tracker : lastTrackers[i])
+			for (Tracker tracker : lastTrackers[marker])
 			{
 				float totalWeight = 0;
 
@@ -516,6 +523,11 @@ int main(int argc, char *argv[])
 
 					auto it = std::find_if(currTrackers[targetMarker].begin(), currTrackers[targetMarker].end(), [tracker](Tracker other) { return other.id == tracker.id; });
 
+					auto calcDist = [](KalmanState &a, KalmanState &b) -> float
+					{
+						return std::sqrt((a.mean[0] - b.mean[0]) * (a.mean[0] - b.mean[0]) + (a.mean[1] - b.mean[1]) * (a.mean[1] - b.mean[1]));
+					};
+
 					if (newProb >= 0.005)
 					{
 						if (it != currTrackers[targetMarker].end())
@@ -523,11 +535,21 @@ int main(int argc, char *argv[])
 							it->kalman.mean = (it->kalman.mean * it->prob + kalmanStates[i].mean * newProb) / (it->prob + newProb);
 							it->kalman.covar = (it->kalman.covar * it->prob + kalmanStates[i].covar * newProb) * (1 / (it->prob + newProb));
 							it->prob += newProb;
+
+							float newDist = tracker.distanceToLastSureMarker + calcDist(tracker.kalman, it->kalman);
+
+							if (newDist < it->distanceToLastSureMarker)
+							{
+								it->distanceToLastSureMarker = newDist;
+								it->prevMarker = marker;
+							}
 						}
 						else
 						{
 							Tracker newTracker{tracker.id, newProb, tracker.dir};
 							newTracker.kalman = kalmanStates[i];
+							newTracker.distanceToLastSureMarker = tracker.distanceToLastSureMarker + calcDist(tracker.kalman, kalmanStates[i]);
+							newTracker.prevMarker = marker;
 							currTrackers[targetMarker].push_back(newTracker);
 						}
 					}
@@ -562,51 +584,97 @@ int main(int argc, char *argv[])
 
 			if (!markerUsed[marker] && std::find(usedIds.begin(), usedIds.end(), tracker.id) == usedIds.end())
 			{
+				// Backpatch - put the id in all previous frames where
+				// it was just a probability.
+
+				Tracker currTracker = tracker;
+				int i = t;
+
+				while (currTracker.prevMarker >= 0)
+				{
+					states[i - 1].ids[currTracker.id] = currTracker.prevMarker;
+					for (auto &newTracker : states[i - 1].trackers[currTracker.prevMarker])
+					{
+						if (newTracker.id == currTracker.id)
+						{
+							currTracker = newTracker;
+							break;
+						}
+					}
+					i--;
+				}
+
 				tracker.prob = 1;
+				tracker.distanceToLastSureMarker = 0;
+				tracker.prevMarker = -1;
 				newTrackers.push_back({marker, tracker});
 				markerUsed[marker] = true;
 				usedIds.push_back(tracker.id);
 				states[t].ids[tracker.id] = marker;
-
-				// Backpatch - put the id in all previous frames where
-				// it was just a probability.
-
+#if OLD
 				int lastMarker = marker;
 
 				for (int i = t - 1; i >= 0; i--)
-				{
+
 					if (states[i].ids.find(tracker.id) != states[i].ids.end())
 						break;
 
-					auto positionRange = states[i + 1].imov.equal_range(lastMarker);
+				auto positionRange = states[i + 1].imov.equal_range(lastMarker);
 
-					int maxMarker = -1;
-					float maxProb = 0;
+				int closestMarker = -1;
+				float minDistance = FLT_MAX;
 
-					// Find all edges that went to the last marker,
-					// and find where was the tracker with the biggest probability.
+				for (auto p = positionRange.first; p != positionRange.second; p++)
+				{
+					int targetMarker = p->second;
 
-					for (auto p = positionRange.first; p != positionRange.second; p++)
+					for (Tracker t : states[i].trackers[targetMarker])
 					{
-						int targetMarker = p->second;
-
-						for (Tracker t : states[i].trackers[targetMarker])
+						if (t.id == tracker.id &&
+							t.distanceToLastSureMarker < minDistance)
 						{
-							if (t.id == tracker.id &&
-								t.prob > maxProb)
-							{
-								maxMarker = targetMarker;
-								maxProb = t.prob;
-							}
+							closestMarker = targetMarker;
+							minDistance = t.distanceToLastSureMarker;
 						}
 					}
-
-					if (maxMarker < 0)
-						break;
-
-					states[i].ids[tracker.id] = maxMarker;
-					lastMarker = maxMarker;
 				}
+
+				if (closestMarker < 0)
+					break;
+
+				states[i].ids[tracker.id] = closestMarker;
+				lastMarker = closestMarker;
+#endif
+#if OLD
+				int maxMarker = -1;
+				float maxProb = 0;
+
+				// Find all edges that went to the last marker,
+				// and find where was the tracker with the biggest probability.
+
+				for (auto p = positionRange.first; p != positionRange.second; p++)
+				{
+					int targetMarker = p->second;
+
+					for (Tracker t : states[i].trackers[targetMarker])
+					{
+						if (t.id == tracker.id &&
+							t.prob > maxProb)
+						{
+							maxMarker = targetMarker;
+							maxProb = t.prob;
+						}
+					}
+				}
+
+				if (maxMarker < 0)
+					break;
+
+				states[i].ids[tracker.id] = maxMarker;
+				lastMarker = maxMarker;
+			}
+		}
+#endif
 			}
 		}
 
@@ -641,6 +709,8 @@ int main(int argc, char *argv[])
 				Tracker tracker{newId};
 				tracker.kalman.mean = Vec4f{currMarkers[i].x, currMarkers[i].y, 0, 0};
 				tracker.kalman.covar = Matx44f::zeros();
+				tracker.distanceToLastSureMarker = 0;
+				tracker.prevMarker = -1;
 				currTrackers[i].push_back(tracker);
 				states[t].ids[newId] = i;
 			}
@@ -687,6 +757,68 @@ int main(int argc, char *argv[])
 
 	float scalingFactor = 2;
 
+	std::tuple<int*, float*, vector<FrameState>*> guiState{&frameIndex, &scalingFactor, &states};
+
+	//
+	// OnClick Information Printing
+	//
+
+	cv::namedWindow("w");
+	cv::setMouseCallback("w",
+		[](int eventType, int x, int y, int flags, void *guiStateUntyped)
+	{
+		if (eventType == cv::EVENT_LBUTTONDOWN)
+		{
+			int *frameIndexPtr;
+			float *scalingFactorPtr;
+			vector<FrameState> *statesPtr;
+
+			auto guiState = static_cast<std::tuple<int*, float*, vector<FrameState>*>*>(guiStateUntyped);
+			std::tie(frameIndexPtr, scalingFactorPtr, statesPtr) = *guiState;
+
+			int frameIndex = *frameIndexPtr;
+			float scalingFactor = *scalingFactorPtr;
+
+			FrameState &currState = (*statesPtr)[frameIndex];
+
+			int closestMarker = -1;
+			float minSqrDistance = FLT_MAX;
+
+			for (int i = 0; i < (int)currState.markers.size(); i++)
+			{
+				float dx = currState.markers[i].x - x / scalingFactor;
+				float dy = currState.markers[i].y - y / scalingFactor;
+
+				float sqrDistance = dx * dx + dy * dy;
+
+				if (sqrDistance < minSqrDistance)
+				{
+					minSqrDistance = sqrDistance;
+					closestMarker = i;
+				}
+			}
+
+			if (closestMarker >= 0)
+			{
+				std::cout << "================" << std::endl;
+				std::cout << "FRAME: " << frameIndex << " MARKER: " << closestMarker << " " << currState.markers[closestMarker] << std::endl;
+				std::cout << "TRACKERS:" << std::endl;
+				for (Tracker &t : currState.trackers[closestMarker])
+				{
+					int sureMarker = currState.ids.find(t.id) != currState.ids.end() &&
+						currState.ids[t.id] == closestMarker;
+					std::cout << "- Tracker id " << t.id << (sureMarker ? " <OFFICIAL>" : "") << std::endl;
+					std::cout << "\tprob: " << t.prob << std::endl;
+					std::cout << "\tdistanceToLastSureMarker: " << t.distanceToLastSureMarker << std::endl;
+					std::cout << "\tprevMarker: " << t.prevMarker << std::endl;
+					std::cout << "\tkalman.mean: " << t.kalman.mean << std::endl;
+					//std::cout << "\tkalman.covar: " << t.kalman.covar << std::endl;
+				}
+			}
+		}
+	},
+		&guiState);
+
 	while (true)
 	{
 		Mat frame = frames[frameIndex];
@@ -694,12 +826,6 @@ int main(int argc, char *argv[])
 		Mat markerMask = getMarkerMask(foreground);
 
 		auto &currMarkers = states[frameIndex].markers;
-		vector<Point2f> lastMarkers;
-
-		if (frameIndex > 0)
-		{
-			lastMarkers = states[frameIndex - 1].markers;
-		}
 
 		Mat display;
 
@@ -881,6 +1007,10 @@ int main(int argc, char *argv[])
 						else if (frameIndex + 1 != frameCount && states[frameIndex + 1].ids.find(tracker.id) == states[frameIndex + 1].ids.end())
 						{
 							color = Scalar{40, 39, 214};
+						}
+						else if (tracker.prob != 1)
+						{
+							color = Scalar{255, 0, 255};
 						}
 						else
 						{
