@@ -3,6 +3,8 @@
 #include <string>
 #include <algorithm>
 #include <map>
+#include <thread>
+#include <mutex>
 
 #include <opencv2/opencv.hpp>
 
@@ -12,6 +14,8 @@ using std::map;
 using std::multimap;
 using std::pair;
 using std::tuple;
+using std::mutex;
+using std::condition_variable;
 
 using cv::Mat;
 using cv::Mat1i;
@@ -33,6 +37,8 @@ using cv::String;
 using cv::VideoCapture;
 using cv::KalmanFilter;
 
+#define IT_RANGE(X) (X).begin(), (X).end()
+
 #define QQQ do {std::cerr << "QQQ " << __FUNCTION__ << " " << __LINE__ << std::endl;} while(0)
 
 void printTimeSinceLastCall(const char* message)
@@ -48,6 +54,10 @@ void printTimeSinceLastCall(const char* message)
 
 	last = curr;
 }
+
+//
+// Image Processing
+//
 
 Mat videoMedian(const vector<Mat> &images)
 {
@@ -67,7 +77,7 @@ Mat videoMedian(const vector<Mat> &images)
 
 	for (int r = 0; r < rows; r++)
 	{
-		std::cout << "Background of row " << r << std::endl;
+		//std::cout << "Background of row " << r << std::endl;
 		for (int c = 0; c < cols; c++)
 		{
 			for (int t = 0; t < imageCount; t++)
@@ -82,6 +92,106 @@ Mat videoMedian(const vector<Mat> &images)
 
 	return median;
 }
+
+Mat getForeground(const Mat &frame, const Mat &background)
+{
+	Mat foreground;
+	cv::absdiff(frame, background, foreground);
+	return foreground;
+}
+
+Mat getMarkerMask(const Mat &foreground)
+{
+	Mat markerMask = foreground >= 30;
+
+	cv::erode(markerMask,
+		markerMask,
+		cv::getStructuringElement(cv::MORPH_ELLIPSE, Size{3, 3}),
+		cv::Point{-1, -1},
+		1);
+
+	//cv::dilate(markerMask,
+	//	markerMask,
+	//	cv::getStructuringElement(cv::MORPH_ELLIPSE, Size{3, 3}),
+	//	cv::Point{-1, -1},
+	//	1);
+
+	return markerMask;
+}
+
+void getFrameMarkers(const Mat &markerMask, vector<Point2f> &outMean, vector<Matx22f> &outCovar)
+{
+	Mat labels;
+	Mat stats;
+	Mat1d centroids;
+
+	cv::connectedComponentsWithStats(
+		markerMask,
+		labels,
+		stats,
+		centroids,
+		4, CV_32S);
+
+	// NOTE: label 0 is the background. We ignore it here.
+
+	vector<Point2f> ccMean(std::max(centroids.rows - 1, 0));
+	vector<Matx22f> ccCovar(ccMean.size(), Matx22f{0, 0, 0, 0});
+
+	for (int r = 1; r < centroids.rows; r++)
+		ccMean[r - 1] = Point2f{(float)centroids(r, 0), (float)centroids(r, 1)};
+
+	for (int r = 0; r < labels.rows; r++)
+	{
+		int *ptr = labels.ptr<int>(r);
+
+		for (int c = 0; c < labels.cols; c++, ptr++)
+		{
+			if (*ptr == 0)
+				continue;
+
+			int id = *ptr - 1;
+
+			Point2f mean = ccMean[id];
+			Matx22f covar = ccCovar[id];
+
+			covar(0, 0) += (c - mean.x) * (c - mean.x);
+			covar(0, 1) += (c - mean.x) * (r - mean.y);
+			covar(1, 0) += (r - mean.y) * (c - mean.x);
+			covar(1, 1) += (r - mean.y) * (r - mean.y);
+
+			ccCovar[id] = covar;
+		}
+	}
+
+	for (int r = 1; r < stats.rows; r++)
+	{
+		int count = stats.at<int>(r, cv::CC_STAT_AREA);
+
+		if (count > 0)
+		{
+			ccCovar[r - 1](0, 0) /= count;
+			ccCovar[r - 1](0, 1) /= count;
+			ccCovar[r - 1](1, 0) /= count;
+			ccCovar[r - 1](1, 1) /= count;
+		}
+	}
+
+	outMean.resize(0);
+	outCovar.resize(0);
+
+	for (int r = 1; r < centroids.rows; r++)
+	{
+		if (stats.at<int>(r, cv::CC_STAT_AREA) > 20)
+		{
+			outMean.push_back(ccMean[r - 1]);
+			outCovar.push_back(ccCovar[r - 1]);
+		}
+	}
+}
+
+//
+// Tracking
+//
 
 struct KalmanState
 {
@@ -124,231 +234,89 @@ struct FrameState
 	int firstNewId;
 };
 
-void drawStateTransitions(Mat &on, const FrameState& first, const FrameState& second, float scalingFactor = 1)
+struct ProcessState
 {
-	for (pair<int, int> transition : second.mov)
-	{
-		cv::arrowedLine(on, first.markers[transition.first] * scalingFactor, second.markers[transition.second] * scalingFactor, Scalar{0, 255, 0}, std::floor(scalingFactor));
-	}
-}
-
-// Taken from: http://www.visiondummy.com/2014/04/draw-error-ellipse-representing-covariance-matrix/
-
-// Chi-Square table is: https://people.richland.edu/james/lecture/m170/tbl-chi.html
-// The square root of the probability is passed.
-
-// Modified: Now expects float matrix instead of double
-
-cv::RotatedRect getErrorEllipse(double chisquare_val, cv::Point2f mean, cv::Mat covmat) {
-
-	//Get the eigenvalues and eigenvectors
-	cv::Mat eigenvalues, eigenvectors;
-	cv::eigen(covmat, eigenvalues, eigenvectors);
-
-	//Calculate the angle between the largest eigenvector and the x-axis
-	double angle = atan2(eigenvectors.at<float>(0, 1), eigenvectors.at<float>(0, 0));
-
-	//Shift the angle to the [0, 2pi] interval instead of [-pi, pi]
-	if (angle < 0)
-		angle += 6.28318530718;
-
-	//Conver to degrees instead of radians
-	angle = 180 * angle / 3.14159265359;
-
-	//Calculate the size of the minor and major axes
-	double halfmajoraxissize = chisquare_val*sqrt(eigenvalues.at<float>(0));
-	double halfminoraxissize = chisquare_val*sqrt(eigenvalues.at<float>(1));
-
-	//Return the oriented ellipse
-	//The -angle is used because OpenCV defines the angle clockwise instead of anti-clockwise
-	// NOTE(Andrey): Modified because for us Y axis is down)
-	return cv::RotatedRect(mean, cv::Size2f(halfmajoraxissize, halfminoraxissize), angle);
-}
-
-int main(int argc, char *argv[])
-{
-	VideoCapture vid;
-
-	//
-	// Load the video
-	//
-
-	{
-		string fileName;
-
-		if (argc == 2)
-			fileName = string{argv[1]};
-
-		bool openedImages = false;
-
-		while (!openedImages)
-		{
-			if (fileName == "")
-			{
-				std::cout << std::endl;
-				std::cout << "\tEnter the filename: (bug00, bugs11, bugs12, bugs14, bugs25 ...) If no extension is specified .mp4 is assumed:" << std::endl;
-				std::cout << "?> ";
-				std::cin >> fileName;
-			}
-
-			if (fileName.find(".") == std::string::npos)
-				fileName += ".mp4";
-
-			fileName = "../video/" + fileName;
-
-			vid = VideoCapture(fileName);
-
-			if (vid.isOpened())
-			{
-				openedImages = true;
-			}
-			else
-			{
-				std::cerr << "\tERROR: Couldn't open file " + fileName << std::endl;
-				fileName = "";
-			}
-		}
-	}
-
-	auto getForeground = [](const Mat &frame, const Mat &background) -> Mat
-	{
-		Mat foreground;
-		cv::absdiff(frame, background, foreground);
-		return foreground;
-	};
-
-	auto getMarkerMask = [](const Mat &foreground) -> Mat
-	{
-		Mat markerMask = foreground >= 30;
-
-		cv::erode(markerMask,
-			markerMask,
-			cv::getStructuringElement(cv::MORPH_ELLIPSE, Size{3, 3}),
-			cv::Point{-1, -1},
-			1);
-
-		//cv::dilate(markerMask,
-		//	markerMask,
-		//	cv::getStructuringElement(cv::MORPH_ELLIPSE, Size{3, 3}),
-		//	cv::Point{-1, -1},
-		//	1);
-
-		//cv::morphologyEx(markerMask,
-		//markerMask,
-		//cv::MORPH_CLOSE,
-		//cv::getStructuringElement(cv::MORPH_ELLIPSE, Size{15, 15}));
-
-		//cv::morphologyEx(markerMask,
-		//markerMask,
-		//cv::MORPH_OPEN,
-		//cv::getStructuringElement(cv::MORPH_ELLIPSE, Size{7, 7}));
-
-		return markerMask;
-	};
-
-	auto getFrameMarkers = [](const Mat &markerMask, vector<Point2f> &outMean, vector<Matx22f> &outCovar)
-	{
-		Mat labels;
-		Mat stats;
-		Mat1d centroids;
-
-		cv::connectedComponentsWithStats(
-			markerMask,
-			labels,
-			stats,
-			centroids,
-			4, CV_32S);
-
-		// NOTE: label 0 is the background. We ignore it here.
-
-		vector<Point2f> ccMean(std::max(centroids.rows - 1, 0));
-		vector<Matx22f> ccCovar(ccMean.size(), Matx22f{0, 0, 0, 0});
-
-		for (int r = 1; r < centroids.rows; r++)
-			ccMean[r - 1] = Point2f{(float)centroids(r, 0), (float)centroids(r, 1)};
-
-		for (int r = 0; r < labels.rows; r++)
-		{
-			int *ptr = labels.ptr<int>(r);
-
-			for (int c = 0; c < labels.cols; c++, ptr++)
-			{
-				if (*ptr == 0)
-					continue;
-
-				int id = *ptr - 1;
-
-				Point2f mean = ccMean[id];
-				Matx22f covar = ccCovar[id];
-
-				covar(0, 0) += (c - mean.x) * (c - mean.x);
-				covar(0, 1) += (c - mean.x) * (r - mean.y);
-				covar(1, 0) += (r - mean.y) * (c - mean.x);
-				covar(1, 1) += (r - mean.y) * (r - mean.y);
-
-				ccCovar[id] = covar;
-			}
-		}
-
-		for (int r = 1; r < stats.rows; r++)
-		{
-			int count = stats.at<int>(r, cv::CC_STAT_AREA);
-
-			if (count > 0)
-			{
-				ccCovar[r - 1](0, 0) /= count;
-				ccCovar[r - 1](0, 1) /= count;
-				ccCovar[r - 1](1, 0) /= count;
-				ccCovar[r - 1](1, 1) /= count;
-			}
-		}
-
-		outMean.resize(0);
-		outCovar.resize(0);
-
-		for (int r = 1; r < centroids.rows; r++)
-		{
-			if (stats.at<int>(r, cv::CC_STAT_AREA) > 20)
-			{
-				outMean.push_back(ccMean[r - 1]);
-				outCovar.push_back(ccCovar[r - 1]);
-			}
-		}
-	};
-
+	mutex framesLock;
+	condition_variable frameLoadedCond;
 	vector<Mat> frames;
+	bool finishedReadingFrames = false;
 
+	Mat background;
+
+	mutex statesLock;
+	vector<FrameState> states;
+	// The index of the earliest state that was changed when this state was computed
+	vector<int> firstChangedState;
+};
+
+void loadVideoGrayscale(ProcessState *ps, VideoCapture *cap)
+{
+	Mat frame;
+	Mat prev;
+	Mat diff;
+
+	while (true)
 	{
-		int i = 0;
-		while (true)
+		if (!cap->read(frame))
+			break;
+
+		cv::cvtColor(frame, frame, cv::COLOR_BGR2GRAY);
+
+		// Sometimes there are duplicated frames in the video.
+		// Here we ignore these frames.
+
+		if (!prev.empty())
 		{
-			Mat frame;
-			if (!vid.read(frame))
-				break;
-
-			// TODO: Work with color video
-			cv::cvtColor(frame, frame, cv::COLOR_BGR2GRAY);
-
-			if (frames.size() > 0)
-			{
-				Mat diff;
-				cv::absdiff(frame, frames.back(), diff);
-				if (cv::countNonZero(diff > 10) <= 50)
-					continue;
-			}
-
-			frames.push_back(frame);
-			std::cout << "Loaded frame " << i++ << std::endl;
+			cv::absdiff(frame, prev, diff);
+			if (cv::countNonZero(diff > 10) <= 50)
+				continue;
 		}
+
+		{
+			std::lock_guard<std::mutex> lock(ps->framesLock);
+			ps->frames.push_back(frame.clone());
+		}
+
+		ps->frameLoadedCond.notify_all();
 	}
 
-	Mat background = videoMedian(vector<Mat>{frames.begin(), frames.begin() + std::min(frames.size(), (size_t)100)});
+	{
+		std::lock_guard<std::mutex> lock(ps->framesLock);
+		ps->finishedReadingFrames = true;
+	}
 
-	int frameCount = frames.size();
-	int frameIndex = 0;
+	ps->frameLoadedCond.notify_all();
 
-	vector<FrameState> states(frames.size());
-	int idCount = 0;
+	std::cout << "Loaded video" << std::endl;
+}
+
+void buildFrameStates(ProcessState *ps, int maxBackgroundFrames)
+{
+	//
+	// Find Background
+	//
+
+	vector<Mat> backgroundFrames;
+
+	{
+		std::unique_lock<std::mutex>lk(ps->framesLock);
+
+		while (!ps->finishedReadingFrames && ps->frames.size() < maxBackgroundFrames)
+		{
+			ps->frameLoadedCond.wait(lk);
+		}
+
+		backgroundFrames = vector<Mat>{ps->frames.begin(), ps->frames.begin() + std::min((int)ps->frames.size(), maxBackgroundFrames)};
+	}
+
+	Mat background = videoMedian(backgroundFrames);
+
+	{
+		std::lock_guard<std::mutex> lock(ps->framesLock);
+		ps->background = background;
+	}
+
+	std::cout << "Created background model" << std::endl;
 
 	//
 	// Create Kalman Filter
@@ -442,36 +410,61 @@ int main(int argc, char *argv[])
 		return currState;
 	};
 
-	for (int t = 0; t < frameCount; t++)
+	int t = 0;
+	int idCount = 0;
+
+	while (true)
 	{
+		//
+		// Make sure we have a new frame available (from the video loading thread)
+		//
+
+		Mat currFrame;
+
+		{
+			std::unique_lock<mutex>lk(ps->framesLock);
+
+			while (ps->background.empty())
+			{
+				ps->frameLoadedCond.wait(lk);
+			}
+
+			// We must load at least one frame
+			while (!ps->finishedReadingFrames && t >= ps->frames.size())
+			{
+				ps->frameLoadedCond.wait(lk);
+			}
+
+			if (ps->finishedReadingFrames && t >= ps->frames.size())
+				break;
+
+			currFrame = ps->frames[t];
+		}
+
 		//
 		// Extract foreground and markers
 		//
 
-		Mat foreground = getForeground(frames[t], background);
+		Mat foreground = getForeground(currFrame, ps->background);
 		Mat markerMask = getMarkerMask(foreground);
 
+		FrameState currState;
 
-		vector<Point2f> currMarkers;
-		getFrameMarkers(markerMask, currMarkers, states[t].covar);
+		FrameState emptyState;
+		const FrameState &lastState = t > 0 ? ps->states[t - 1] : emptyState;
 
-		vector<Point2f> lastMarkers = t > 0 ? states[t - 1].markers : vector<Point2f>{};
-
-		vector<vector<Tracker>> emptyTrackers;
-
-		auto &currTrackers = states[t].trackers;
-		auto &lastTrackers = t > 0 ? states[t - 1].trackers : emptyTrackers;
+		getFrameMarkers(markerMask, currState.markers, currState.covar);
 
 		//
 		// Create the transition graph
 		//
 
-		for (int i = 0; i < lastMarkers.size(); i++)
+		for (int i = 0; i < lastState.markers.size(); i++)
 		{
-			for (int k = 0; k < currMarkers.size(); k++)
+			for (int k = 0; k < currState.markers.size(); k++)
 			{
-				float dx = lastMarkers[i].x - currMarkers[k].x;
-				float dy = lastMarkers[i].y - currMarkers[k].y;
+				float dx = lastState.markers[i].x - currState.markers[k].x;
+				float dy = lastState.markers[i].y - currState.markers[k].y;
 
 				float squareDist = dx * dx + dy * dy;
 
@@ -479,8 +472,8 @@ int main(int argc, char *argv[])
 
 				if (squareDist <= lowThresh)
 				{
-					states[t].mov.insert({i, k});
-					states[t].imov.insert({k, i});
+					currState.mov.insert({i, k});
+					currState.imov.insert({k, i});
 				}
 			}
 		}
@@ -489,11 +482,11 @@ int main(int argc, char *argv[])
 		// Simulate movement from previous frame
 		//
 
-		currTrackers = vector<vector<Tracker>>(currMarkers.size());
+		currState.trackers = vector<vector<Tracker>>(currState.markers.size());
 
-		for (int marker = 0; marker < (int)lastTrackers.size(); marker++)
+		for (int marker = 0; marker < (int)lastState.trackers.size(); marker++)
 		{
-			auto edgeRange = states[t].mov.equal_range(marker);
+			auto edgeRange = currState.mov.equal_range(marker);
 
 			vector<int> edges;
 
@@ -503,14 +496,14 @@ int main(int argc, char *argv[])
 			vector<KalmanState> kalmanStates(edges.size());
 			vector<float> weights(edges.size());
 
-			for (Tracker tracker : lastTrackers[marker])
+			for (Tracker tracker : lastState.trackers[marker])
 			{
 				float totalWeight = 0;
 
 				for (int i = 0; i < (int)edges.size(); i++)
 				{
 					float distance;
-					kalmanStates[i] = updateKalman(tracker.kalman, currMarkers[edges[i]], states[t].covar[edges[i]], &distance);
+					kalmanStates[i] = updateKalman(tracker.kalman, currState.markers[edges[i]], currState.covar[edges[i]], &distance);
 					weights[i] = 1 / std::max(distance, 0.1f);
 					totalWeight += weights[i];
 				}
@@ -521,7 +514,7 @@ int main(int argc, char *argv[])
 					float newProb = tracker.prob * weights[i] / totalWeight;
 					newProb *= 0.97f;
 
-					auto it = std::find_if(currTrackers[targetMarker].begin(), currTrackers[targetMarker].end(), [tracker](Tracker other) { return other.id == tracker.id; });
+					auto it = std::find_if(IT_RANGE(currState.trackers[targetMarker]), [tracker](Tracker other) { return other.id == tracker.id; });
 
 					auto calcDist = [](KalmanState &a, KalmanState &b) -> float
 					{
@@ -530,7 +523,7 @@ int main(int argc, char *argv[])
 
 					if (newProb >= 0.005)
 					{
-						if (it != currTrackers[targetMarker].end())
+						if (it != currState.trackers[targetMarker].end())
 						{
 							it->kalman.mean = (it->kalman.mean * it->prob + kalmanStates[i].mean * newProb) / (it->prob + newProb);
 							it->kalman.covar = (it->kalman.covar * it->prob + kalmanStates[i].covar * newProb) * (1 / (it->prob + newProb));
@@ -550,21 +543,21 @@ int main(int argc, char *argv[])
 							newTracker.kalman = kalmanStates[i];
 							newTracker.distanceToLastSureMarker = tracker.distanceToLastSureMarker + calcDist(tracker.kalman, kalmanStates[i]);
 							newTracker.prevMarker = marker;
-							currTrackers[targetMarker].push_back(newTracker);
+							currState.trackers[targetMarker].push_back(newTracker);
 						}
 					}
 				}
 			}
 		}
 
-		vector<bool> markerUsed(currMarkers.size(), false);
+		vector<bool> markerUsed(currState.markers.size(), false);
 		vector<int> usedIds;
 
 		vector<tuple<float, int, Tracker>> allTrackers;
 
-		for (int i = 0; i < (int)currTrackers.size(); i++)
+		for (int i = 0; i < (int)currState.trackers.size(); i++)
 		{
-			for (Tracker t : currTrackers[i])
+			for (Tracker t : currState.trackers[i])
 			{
 				allTrackers.push_back({t.prob, i, t});
 			}
@@ -574,107 +567,54 @@ int main(int argc, char *argv[])
 
 		vector<pair<int, Tracker>> newTrackers;
 
-		for (auto item : allTrackers)
 		{
-			float prob;
-			int marker;
-			Tracker tracker;
+			std::lock_guard<mutex> lock(ps->statesLock);
+			ps->firstChangedState.push_back(t);
 
-			std::tie(prob, marker, tracker) = item;
-
-			if (!markerUsed[marker] && std::find(usedIds.begin(), usedIds.end(), tracker.id) == usedIds.end())
+			for (auto item : allTrackers)
 			{
-				// Backpatch - put the id in all previous frames where
-				// it was just a probability.
+				float prob;
+				int marker;
+				Tracker tracker;
 
-				Tracker currTracker = tracker;
-				int i = t;
+				std::tie(prob, marker, tracker) = item;
 
-				while (currTracker.prevMarker >= 0)
+
+
+				if (!markerUsed[marker] && std::find(usedIds.begin(), usedIds.end(), tracker.id) == usedIds.end())
 				{
-					states[i - 1].ids[currTracker.id] = currTracker.prevMarker;
-					for (auto &newTracker : states[i - 1].trackers[currTracker.prevMarker])
+					// Backpatch - put the id in all previous frames where
+					// it was just a probability.
+
 					{
-						if (newTracker.id == currTracker.id)
+						Tracker currTracker = tracker;
+						int i = t;
+
+
+						while (currTracker.prevMarker >= 0)
 						{
-							currTracker = newTracker;
-							break;
+							ps->states[i - 1].ids[currTracker.id] = currTracker.prevMarker;
+							for (auto &newTracker : ps->states[i - 1].trackers[currTracker.prevMarker])
+							{
+								if (newTracker.id == currTracker.id)
+								{
+									currTracker = newTracker;
+									break;
+								}
+							}
+							i--;
 						}
+						ps->firstChangedState.back() = std::min(ps->firstChangedState.back(), i);
 					}
-					i--;
+
+					tracker.prob = 1;
+					tracker.distanceToLastSureMarker = 0;
+					tracker.prevMarker = -1;
+					newTrackers.push_back({marker, tracker});
+					markerUsed[marker] = true;
+					usedIds.push_back(tracker.id);
+					currState.ids[tracker.id] = marker;
 				}
-
-				tracker.prob = 1;
-				tracker.distanceToLastSureMarker = 0;
-				tracker.prevMarker = -1;
-				newTrackers.push_back({marker, tracker});
-				markerUsed[marker] = true;
-				usedIds.push_back(tracker.id);
-				states[t].ids[tracker.id] = marker;
-#if OLD
-				int lastMarker = marker;
-
-				for (int i = t - 1; i >= 0; i--)
-
-					if (states[i].ids.find(tracker.id) != states[i].ids.end())
-						break;
-
-				auto positionRange = states[i + 1].imov.equal_range(lastMarker);
-
-				int closestMarker = -1;
-				float minDistance = FLT_MAX;
-
-				for (auto p = positionRange.first; p != positionRange.second; p++)
-				{
-					int targetMarker = p->second;
-
-					for (Tracker t : states[i].trackers[targetMarker])
-					{
-						if (t.id == tracker.id &&
-							t.distanceToLastSureMarker < minDistance)
-						{
-							closestMarker = targetMarker;
-							minDistance = t.distanceToLastSureMarker;
-						}
-					}
-				}
-
-				if (closestMarker < 0)
-					break;
-
-				states[i].ids[tracker.id] = closestMarker;
-				lastMarker = closestMarker;
-#endif
-#if OLD
-				int maxMarker = -1;
-				float maxProb = 0;
-
-				// Find all edges that went to the last marker,
-				// and find where was the tracker with the biggest probability.
-
-				for (auto p = positionRange.first; p != positionRange.second; p++)
-				{
-					int targetMarker = p->second;
-
-					for (Tracker t : states[i].trackers[targetMarker])
-					{
-						if (t.id == tracker.id &&
-							t.prob > maxProb)
-						{
-							maxMarker = targetMarker;
-							maxProb = t.prob;
-						}
-					}
-				}
-
-				if (maxMarker < 0)
-					break;
-
-				states[i].ids[tracker.id] = maxMarker;
-				lastMarker = maxMarker;
-			}
-		}
-#endif
 			}
 		}
 
@@ -690,78 +630,135 @@ int main(int argc, char *argv[])
 				newTrackers.push_back({marker, tracker});
 		}
 
-		for (auto &v : currTrackers)
+		for (auto &v : currState.trackers)
 			v.resize(0);
 		for (pair<int, Tracker> t : newTrackers)
-			currTrackers[t.first].push_back(t.second);
+			currState.trackers[t.first].push_back(t.second);
 
 		//
 		// Assign ids to empty markers
 		//
 
-		states[t].firstNewId = idCount;
+		currState.firstNewId = idCount;
 
-		for (int i = 0; i < (int)currTrackers.size(); i++)
+		for (int i = 0; i < (int)currState.trackers.size(); i++)
 		{
-			if (currTrackers[i].empty())
+			if (currState.trackers[i].empty())
 			{
 				int newId = idCount++;
 				Tracker tracker{newId};
-				tracker.kalman.mean = Vec4f{currMarkers[i].x, currMarkers[i].y, 0, 0};
+				tracker.kalman.mean = Vec4f{currState.markers[i].x, currState.markers[i].y, 0, 0};
 				tracker.kalman.covar = Matx44f::zeros();
 				tracker.distanceToLastSureMarker = 0;
 				tracker.prevMarker = -1;
-				currTrackers[i].push_back(tracker);
-				states[t].ids[newId] = i;
+				currState.trackers[i].push_back(tracker);
+				currState.ids[newId] = i;
 			}
 		}
 
-		states[t].markers = currMarkers;
+		{
+			std::lock_guard<mutex> lock(ps->statesLock);
+			ps->states.push_back(std::move(currState));
+			t++;
+		}
 
 		std::cout << "Processed frame " << t << std::endl;
 	}
+}
+
+//
+// GUI
+//
+
+void drawStateTransitions(Mat &on, const FrameState& first, const FrameState& second, float scalingFactor = 1)
+{
+	for (pair<int, int> transition : second.mov)
+	{
+		cv::arrowedLine(on, first.markers[transition.first] * scalingFactor, second.markers[transition.second] * scalingFactor, Scalar{0, 255, 0}, std::floor(scalingFactor));
+	}
+}
+
+// Taken from: http://www.visiondummy.com/2014/04/draw-error-ellipse-representing-covariance-matrix/
+
+// Chi-Square table is: https://people.richland.edu/james/lecture/m170/tbl-chi.html
+// The square root of the probability is passed.
+
+// Modified: Now expects float matrix instead of double
+
+cv::RotatedRect getErrorEllipse(double chisquare_val, cv::Point2f mean, cv::Mat covmat) {
+
+	//Get the eigenvalues and eigenvectors
+	cv::Mat eigenvalues, eigenvectors;
+	cv::eigen(covmat, eigenvalues, eigenvectors);
+
+	//Calculate the angle between the largest eigenvector and the x-axis
+	double angle = atan2(eigenvectors.at<float>(0, 1), eigenvectors.at<float>(0, 0));
+
+	//Shift the angle to the [0, 2pi] interval instead of [-pi, pi]
+	if (angle < 0)
+		angle += 6.28318530718;
+
+	//Conver to degrees instead of radians
+	angle = 180 * angle / 3.14159265359;
+
+	//Calculate the size of the minor and major axes
+	double halfmajoraxissize = chisquare_val*sqrt(eigenvalues.at<float>(0));
+	double halfminoraxissize = chisquare_val*sqrt(eigenvalues.at<float>(1));
+
+	//Return the oriented ellipse
+	//The -angle is used because OpenCV defines the angle clockwise instead of anti-clockwise
+	// NOTE(Andrey): Modified because for us Y axis is down)
+	return cv::RotatedRect(mean, cv::Size2f(halfmajoraxissize, halfminoraxissize), angle);
+}
 
 #ifdef _WIN32
-	enum Keys
-	{
-		KEY_ARROW_LEFT = 0x250000,
-		KEY_ARROW_UP = 0x260000,
-		KEY_ARROW_RIGHT = 0x270000,
-		KEY_ARROW_DOWN = 0x280000,
-		KEY_HOME = 0x240000,
-		KEY_END = 0x230000,
-	};
+enum KeyCodes
+{
+	KEY_ARROW_LEFT = 0x250000,
+	KEY_ARROW_UP = 0x260000,
+	KEY_ARROW_RIGHT = 0x270000,
+	KEY_ARROW_DOWN = 0x280000,
+	KEY_HOME = 0x240000,
+	KEY_END = 0x230000,
+};
 #else
-	enum Keys
-	{
-		KEY_ARROW_LEFT = 65361,
-		KEY_ARROW_UP = 65362,
-		KEY_ARROW_RIGHT = 65363,
-		KEY_ARROW_DOWN = 65364,
-		KEY_HOME = 65360,
-		KEY_END = 65367,
-	};
+enum KeyCodes
+{
+	KEY_ARROW_LEFT = 65361,
+	KEY_ARROW_UP = 65362,
+	KEY_ARROW_RIGHT = 65363,
+	KEY_ARROW_DOWN = 65364,
+	KEY_HOME = 65360,
+	KEY_END = 65367,
+};
 #endif
 
+void drawGUI(ProcessState *otherPs)
+{
+	ProcessState ps;
+	vector<FrameState> &states = ps.states;
+	size_t syncedStatesCount = 0;
+
+	int frameIndex = 0;
 	bool playing = true;
 	int mode = 4;
 
-	bool qShowMarkers = true;
-	bool qShowTransitions = false;
-	bool qShowIds = true;
-	bool qShowTrails = false;
-	bool qShowMarkerIds = false;
-	bool qShowVelocities = false;
-	bool qShowMarkerCovar = false;
-	bool qShowTrackerCovar = false;
+	bool qShowMarkers		= true;
+	bool qShowTransitions	= false;
+	bool qShowIds			= true;
+	bool qShowTrails		= false;
+	bool qShowMarkerIds		= false;
+	bool qShowVelocities	= false;
+	bool qShowMarkerCovar	= false;
+	bool qShowTrackerCovar	= false;
 
 	float scalingFactor = 2;
-
-	std::tuple<int*, float*, vector<FrameState>*> guiState{&frameIndex, &scalingFactor, &states};
 
 	//
 	// OnClick Information Printing
 	//
+
+	std::tuple<int*, float*, vector<FrameState>*> guiState{&frameIndex, &scalingFactor, &ps.states};
 
 	cv::namedWindow("w");
 	cv::setMouseCallback("w",
@@ -821,8 +818,50 @@ int main(int argc, char *argv[])
 
 	while (true)
 	{
-		Mat frame = frames[frameIndex];
-		Mat foreground = getForeground(frame, background);
+		//
+		// Sync process state with worker thread
+		//
+
+		{
+			std::unique_lock<mutex>lk(otherPs->framesLock);
+
+			// We must load at least one frame
+			while (!otherPs->finishedReadingFrames && otherPs->frames.size() == 0)
+			{
+				otherPs->frameLoadedCond.wait(lk);
+			}
+			if (otherPs->frames.size() == 0)
+				return;
+
+			// Bring the changes
+			if (otherPs->frames.size() > ps.frames.size())
+			{
+				ps.frames.insert(ps.frames.end(), otherPs->frames.begin() + ps.frames.size(), otherPs->frames.end());
+			}
+
+			ps.background = otherPs->background.empty() ? ps.frames[0] : otherPs->background;
+			ps.states.resize(ps.frames.size());
+		}
+
+		{
+			std::lock_guard<mutex> lock(otherPs->statesLock);
+
+			if (syncedStatesCount < otherPs->states.size())
+			{
+				int startIndex = *std::min_element(otherPs->firstChangedState.begin() + syncedStatesCount, otherPs->firstChangedState.end());
+				int endIndex = otherPs->states.size();
+
+				ps.states.resize(std::max((int)ps.states.size(), endIndex));
+
+				for (int i = startIndex; i < endIndex; i++)
+					ps.states[i] = otherPs->states[i];
+
+				syncedStatesCount = endIndex;
+			}
+		}
+
+		Mat frame = ps.frames[frameIndex];
+		Mat foreground = getForeground(frame, ps.background);
 		Mat markerMask = getMarkerMask(foreground);
 
 		auto &currMarkers = states[frameIndex].markers;
@@ -863,8 +902,8 @@ int main(int argc, char *argv[])
 				cv::applyColorMap(valueMat, colorMat, cv::COLORMAP_JET);
 				Scalar color{colorMat.at<cv::Vec3b>()};
 
-				Mat frame = frames[frameIndex - historyLength + t];
-				Mat foreground = getForeground(frame, background);
+				Mat frame = ps.frames[frameIndex - historyLength + t];
+				Mat foreground = getForeground(frame, ps.background);
 				Mat markerMask = getMarkerMask(foreground);
 
 				if (mode == 5)
@@ -889,7 +928,7 @@ int main(int argc, char *argv[])
 		}
 		case 7:
 			if (frameIndex > 0)
-				cv::absdiff(frames[frameIndex], frames[frameIndex - 1], display);
+				cv::absdiff(ps.frames[frameIndex], ps.frames[frameIndex - 1], display);
 			else
 				display = frame.clone();
 			break;
@@ -1004,7 +1043,7 @@ int main(int argc, char *argv[])
 						{
 							color = Scalar{44, 160, 44};
 						}
-						else if (frameIndex + 1 != frameCount && states[frameIndex + 1].ids.find(tracker.id) == states[frameIndex + 1].ids.end())
+						else if (frameIndex + 1 != ps.frames.size() && states[frameIndex + 1].ids.find(tracker.id) == states[frameIndex + 1].ids.end())
 						{
 							color = Scalar{40, 39, 214};
 						}
@@ -1063,9 +1102,9 @@ int main(int argc, char *argv[])
 		cv::setWindowTitle("w", "Active trackers: " + std::to_string(states[frameIndex].ids.size()) + " Frame: " + std::to_string(frameIndex));
 
 		if (playing)
-			frameIndex = std::min(frameIndex + 1, frameCount - 1);
+			frameIndex = std::min(frameIndex + 1, (int)ps.frames.size() - 1);
 
-		int pressedKey = cv::waitKey(playing ? 30 : 0);
+		int pressedKey = cv::waitKey(30);
 
 		switch (pressedKey)
 		{
@@ -1078,10 +1117,12 @@ int main(int argc, char *argv[])
 			frameIndex = 0;
 			break;
 		case KEY_END:
-			frameIndex = frameCount - 1;
+			frameIndex = (int)ps.frames.size() - 1;
+			frameIndex = std::max(frameIndex, 0);
 			break;
 		case KEY_ARROW_RIGHT:
-			frameIndex = std::min(frameIndex + (playing ? 4 : 1), frameCount - 1);
+			frameIndex = std::min(frameIndex + (playing ? 4 : 1), (int)ps.frames.size() - 1);
+			frameIndex = std::max(frameIndex, 0);
 			break;
 		case KEY_ARROW_LEFT:
 			frameIndex = std::max(frameIndex - (playing ? 4 : 1), 0);
@@ -1123,6 +1164,68 @@ int main(int argc, char *argv[])
 		if ('0' <= pressedKey && pressedKey <= '9')
 			mode = pressedKey - '0';
 	}
+}
+
+
+int main(int argc, char *argv[])
+{
+	VideoCapture vid;
+
+	//
+	// Get video name from the command line and load it
+	//
+
+	{
+		string fileName;
+
+		if (argc == 2)
+			fileName = string{argv[1]};
+
+		bool openedImages = false;
+
+		while (!openedImages)
+		{
+			if (fileName == "")
+			{
+				std::cout << std::endl;
+				std::cout << "\tEnter the filename: (bug00, bugs11, bugs12, bugs14, bugs25 ...) If no extension is specified .mp4 is assumed:" << std::endl;
+				std::cout << "?> ";
+				std::cin >> fileName;
+			}
+
+			if (fileName.find(".") == std::string::npos)
+				fileName += ".mp4";
+
+			fileName = "../video/" + fileName;
+
+			vid = VideoCapture(fileName);
+
+			if (vid.isOpened())
+			{
+				openedImages = true;
+			}
+			else
+			{
+				std::cerr << "\tERROR: Couldn't open file " + fileName << std::endl;
+				fileName = "";
+			}
+		}
+	}
+
+	//
+	// Load video in one thread, process in second thread,
+	// draw a GUI in a third thread.
+	//
+
+	ProcessState ps;
+
+	std::thread videoLoadingThread(loadVideoGrayscale, &ps, &vid);
+	std::thread processingThread(buildFrameStates, &ps, 100);
+	std::thread guiThread(drawGUI, &ps);
+
+	guiThread.join();
+	videoLoadingThread.join();
+	processingThread.join();
 
 	return 0;
 }
