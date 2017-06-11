@@ -240,6 +240,7 @@ struct ProcessState
 	condition_variable frameLoadedCond;
 	vector<Mat> frames;
 	bool finishedReadingFrames = false;
+	int totalFrameCount = 0;
 
 	Mat background;
 
@@ -254,6 +255,9 @@ void loadVideoGrayscale(ProcessState *ps, VideoCapture *cap)
 	Mat frame;
 	Mat prev;
 	Mat diff;
+
+	double frameCount = cap->get(cv::CAP_PROP_FRAME_COUNT);
+	ps->totalFrameCount = frameCount > 0 ? (int)(frameCount + 0.5) : 0;
 
 	while (true)
 	{
@@ -308,6 +312,8 @@ void buildFrameStates(ProcessState *ps, int maxBackgroundFrames)
 
 		backgroundFrames = vector<Mat>{ps->frames.begin(), ps->frames.begin() + std::min((int)ps->frames.size(), maxBackgroundFrames)};
 	}
+
+	std::cout << "Creating background model" << std::endl;
 
 	Mat background = videoMedian(backgroundFrames);
 
@@ -661,8 +667,6 @@ void buildFrameStates(ProcessState *ps, int maxBackgroundFrames)
 			ps->states.push_back(std::move(currState));
 			t++;
 		}
-
-		std::cout << "Processed frame " << t << std::endl;
 	}
 }
 
@@ -752,7 +756,7 @@ void drawGUI(ProcessState *otherPs)
 	bool qShowMarkerCovar	= false;
 	bool qShowTrackerCovar	= false;
 
-	float scalingFactor = 2;
+	float scalingFactor = 1;
 
 	//
 	// OnClick Information Printing
@@ -840,6 +844,7 @@ void drawGUI(ProcessState *otherPs)
 			}
 
 			ps.background = otherPs->background.empty() ? ps.frames[0] : otherPs->background;
+			ps.totalFrameCount = otherPs->totalFrameCount;
 			ps.states.resize(ps.frames.size());
 		}
 
@@ -867,6 +872,7 @@ void drawGUI(ProcessState *otherPs)
 		auto &currMarkers = states[frameIndex].markers;
 
 		Mat display;
+		Mat controlBar;
 
 		switch (mode)
 		{
@@ -1043,7 +1049,9 @@ void drawGUI(ProcessState *otherPs)
 						{
 							color = Scalar{44, 160, 44};
 						}
-						else if (frameIndex + 1 != ps.frames.size() && states[frameIndex + 1].ids.find(tracker.id) == states[frameIndex + 1].ids.end())
+						else if (frameIndex + 1 != ps.frames.size() &&
+							syncedStatesCount == ps.frames.size() &&
+							states[frameIndex + 1].ids.find(tracker.id) == states[frameIndex + 1].ids.end())
 						{
 							color = Scalar{40, 39, 214};
 						}
@@ -1098,10 +1106,37 @@ void drawGUI(ProcessState *otherPs)
 			}
 		}
 
+		{
+			controlBar.create(30, display.cols, display.type());
+			controlBar.setTo(Scalar{51, 52, 52});
+			controlBar.row(0).setTo(Scalar{30, 30, 30});
+			controlBar.row(controlBar.rows - 1).setTo(Scalar{30, 30, 30});
+
+			int totalFrameCount = std::max(ps.totalFrameCount, (int)ps.frames.size());
+
+			int loadedFramesEnd = controlBar.cols * ps.frames.size() / totalFrameCount;
+			cv::rectangle(controlBar, Point2i{loadedFramesEnd, 0}, Point2i{controlBar.cols, controlBar.rows}, Scalar{30, 30, 30}, -1);
+
+			int processedStatesEnd = controlBar.cols * syncedStatesCount / totalFrameCount;
+			cv::rectangle(controlBar, Point2i{0, controlBar.rows - 5}, Point2i{processedStatesEnd, controlBar.rows}, Scalar{44, 160, 44}, -1);
+
+			int sliderLength = controlBar.cols;
+			int hangleWidth = 10;
+			int sliderActiveRange = sliderLength - hangleWidth + 1;
+
+			int sliderPos = sliderActiveRange * frameIndex / (std::max(totalFrameCount, 2) - 1);
+
+			Rect hangleRect{sliderPos, 0, hangleWidth, controlBar.rows};
+			cv::rectangle(controlBar, hangleRect, Scalar{147, 150, 150}, -1);
+			cv::rectangle(controlBar, hangleRect, Scalar{30, 30, 30}, 1);
+
+			cv::vconcat(display, controlBar, display);
+		}
+
 		cv::imshow("w", display);
 		cv::setWindowTitle("w", "Active trackers: " + std::to_string(states[frameIndex].ids.size()) + " Frame: " + std::to_string(frameIndex));
 
-		if (playing)
+		if (playing && (frameIndex != syncedStatesCount && frameIndex != syncedStatesCount - 1))
 			frameIndex = std::min(frameIndex + 1, (int)ps.frames.size() - 1);
 
 		int pressedKey = cv::waitKey(30);
