@@ -179,9 +179,31 @@ void getFrameMarkers(const Mat &markerMask, vector<Point2f> &outMean, vector<Mat
 	outMean.resize(0);
 	outCovar.resize(0);
 
+	int minSize = 20;
+
+	{
+		vector<int> areas;
+
+		for (int r = 1; r < stats.rows; r++)
+		{
+			int area = stats.at<int>(r, cv::CC_STAT_AREA);
+			if (area > 20)
+				areas.push_back(area);
+		}
+
+		if (areas.size() != 0)
+		{
+			std::nth_element(areas.begin(), areas.begin() + areas.size() / 2, areas.end());
+			int newMinSize = areas[areas.size() / 2] / 2;
+			minSize = std::max(minSize, newMinSize);
+		}
+
+		std::cout << minSize << std::endl;
+	}
+
 	for (int r = 1; r < centroids.rows; r++)
 	{
-		if (stats.at<int>(r, cv::CC_STAT_AREA) > 20)
+		if (stats.at<int>(r, cv::CC_STAT_AREA) > minSize)
 		{
 			outMean.push_back(ccMean[r - 1]);
 			outCovar.push_back(ccCovar[r - 1]);
@@ -193,23 +215,29 @@ void getFrameMarkers(const Mat &markerMask, vector<Point2f> &outMean, vector<Mat
 // Tracking
 //
 
+// We could use a cv::KalmanFilter everywhere, but it allocates
+// a bunch of temporary data on the heap, which makes it expensive
+// to have many copies of it. Here we store just the data we need
+// in a fixed size struct.
 struct KalmanState
 {
 	Vec4f mean;
 	Matx44f covar;
 };
 
+// Represents that some ID could be here with probability PROB,
+// and movement state described by KALMAN.
 struct Tracker
 {
 	int id;
 	float prob;
-	Point2f dir;
 	KalmanState kalman;
-	float distanceToLastSureMarker;
+	// The predecessor of this tracker
 	int prevMarker;
+	float distanceToLastSureMarker;
 
-	Tracker(int id = 0, float prob = 1, Point2f dir = Point2f{0, 0})
-		: id{id}, prob{prob}, dir{dir}
+	Tracker(int id = 0, float prob = 1)
+		: id{id}, prob{prob}
 	{ }
 
 	bool operator<(const Tracker& other) const
@@ -246,7 +274,8 @@ struct ProcessState
 
 	mutex statesLock;
 	vector<FrameState> states;
-	// The index of the earliest state that was changed when this state was computed
+	// The index of the earliest state that was changed when this state was computed.
+	// This is used for syncing by the GUI thread.
 	vector<int> firstChangedState;
 };
 
@@ -545,7 +574,7 @@ void buildFrameStates(ProcessState *ps, int maxBackgroundFrames)
 						}
 						else
 						{
-							Tracker newTracker{tracker.id, newProb, tracker.dir};
+							Tracker newTracker{tracker.id, newProb};
 							newTracker.kalman = kalmanStates[i];
 							newTracker.distanceToLastSureMarker = tracker.distanceToLastSureMarker + calcDist(tracker.kalman, kalmanStates[i]);
 							newTracker.prevMarker = marker;
@@ -752,11 +781,10 @@ void drawGUI(ProcessState *otherPs)
 	bool qShowIds			= true;
 	bool qShowTrails		= false;
 	bool qShowMarkerIds		= false;
-	bool qShowVelocities	= false;
 	bool qShowMarkerCovar	= false;
 	bool qShowTrackerCovar	= false;
 
-	float scalingFactor = 1;
+	float scalingFactor = 2;
 
 	//
 	// OnClick Information Printing
@@ -945,7 +973,7 @@ void drawGUI(ProcessState *otherPs)
 		if (display.type() == CV_8U)
 			cv::cvtColor(display, display, cv::COLOR_GRAY2BGR);
 
-		cv::resize(display, display, Size{(int)(display.cols * scalingFactor), (int)(display.rows * scalingFactor)});
+		cv::resize(display, display, Size{0, 0}, scalingFactor, scalingFactor, cv::INTER_NEAREST);
 
 		if (qShowTrails)
 		{
@@ -1090,21 +1118,6 @@ void drawGUI(ProcessState *otherPs)
 				cv::putText(display, std::to_string(i), marker * scalingFactor, cv::FONT_HERSHEY_SIMPLEX, 0.5, Scalar{0, 255, 255});
 			}
 		}
-		if (qShowVelocities)
-		{
-			for (int i = 0; i < (int)states[frameIndex].trackers.size(); i++)
-			{
-				Point2f marker = states[frameIndex].markers[i];
-
-				for (Tracker t : states[frameIndex].trackers[i])
-				{
-					if (states[frameIndex].ids.find(t.id) != states[frameIndex].ids.end())
-					{
-						cv::arrowedLine(display, marker * scalingFactor, (marker + t.dir * 20) * scalingFactor, Scalar{244, 134, 66}, std::floor(scalingFactor));
-					}
-				}
-			}
-		}
 
 		{
 			controlBar.create(30, display.cols, display.type());
@@ -1182,9 +1195,6 @@ void drawGUI(ProcessState *otherPs)
 			break;
 		case 'd':
 			qShowMarkerIds = !qShowMarkerIds;
-			break;
-		case 'v':
-			qShowVelocities = !qShowVelocities;
 			break;
 		case 'c':
 			qShowMarkerCovar = !qShowMarkerCovar;
